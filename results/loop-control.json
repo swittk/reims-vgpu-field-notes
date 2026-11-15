@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "scope": "single anonymized Linux x86-64 NVIDIA host; finite sequential runs; no host IDs",
+  "native_loop_before": {
+    "presentations_per_second": 59.626,
+    "gaps_over_60_ms": 6,
+    "worst_gap_ms": 110.855,
+    "duration_seconds": 150,
+    "format": "original 4K HEVC display-only native player"
+  },
+  "native_loop_after": {
+    "presentations_per_second": 59.9352185,
+    "presentations": 8690,
+    "gaps_over_60_ms": 0,
+    "worst_gap_ms": 55.357,
+    "duration_seconds": 150
+  },
+  "original_screensaver_final": {
+    "frames": 7801,
+    "duration_seconds": 259.994,
+    "fps": 30.00075,
+    "qemu_worst_gap_ms": 59.6,
+    "qemu_gaps_over_60_ms": 0,
+    "capture_transport_worst_gap_ms": 61,
+    "capture_transport_gaps_over_60_ms": 1,
+    "loop_transition_worst_gap_ms": 39.0,
+    "dropped_frames": 0,
+    "capture_errors": 0,
+    "hash_order_backsteps": 0
+  },
+  "native_codec_reference": {
+    "h264_encoder_each_mode_changing_frames": 90,
+    "hevc_encoder_each_mode_changing_frames": 90,
+    "hevc_8bit_reference_frames_exact": 64,
+    "hevc_10bit_reference_frames_exact": 64
+  },
+  "limitations": [
+    "single host, not representative sample",
+    "native loop and original screensaver run at different FPS",
+    "sequential observations",
+    "capture transport not QEMU presentation",
+    "one isolated 61 ms capture transport interval",
+    "no machine IDs or licensed media redistributed"
+  ]
+}

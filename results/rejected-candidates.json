@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "scope": "sequential, differently instrumented finite controls; not randomized A/B",
+  "trials": [
+    {
+      "id": "eager-scattered-alias",
+      "approx_mappings_per_4k_surface": 6079,
+      "some_buffer_wait_ms_range": [
+        54,
+        89
+      ],
+      "decision": "expensive critical-path construction"
+    },
+    {
+      "id": "deferred-v1",
+      "duration_seconds": 280,
+      "gaps_over_60_ms": 15,
+      "worst_gap_ms": 574.692,
+      "decision": "rejected"
+    },
+    {
+      "id": "fresh-deferred-v2",
+      "duration_seconds": 280,
+      "gaps_over_60_ms": 16,
+      "worst_gap_ms": 161.849,
+      "decision": "rejected"
+    },
+    {
+      "id": "immutable-upload-v3",
+      "duration_seconds": 280,
+      "gaps_over_60_ms": 5,
+      "worst_gap_ms": 92.167,
+      "decision": "intermediate: rejected for loop closure"
+    },
+    {
+      "id": "bulk-upload-v4",
+      "duration_seconds": 280,
+      "gaps_over_60_ms": 12,
+      "worst_gap_ms": 81.723,
+      "upload_p99_ms": 9.729,
+      "decision": "intermediate: rejected for loop closure"
+    },
+    {
+      "id": "disable-all-direct-writes-control",
+      "duration_seconds": 260,
+      "frames": 7801,
+      "gaps_over_60_ms": 0,
+      "worst_gap_ms": 48,
+      "cpu_cores_approx": 2.46,
+      "decision": "diagnostic only"
+    },
+    {
+      "id": "structural-host-import-eligibility",
+      "duration_seconds": 260,
+      "frames": 7801,
+      "qemu_gaps_over_60_ms": 0,
+      "qemu_worst_gap_ms": 59.6,
+      "cpu_cores_approx": 1.76,
+      "decision": "bounded accepted implementation"
+    }
+  ],
+  "cpu_microbenchmark": {
+    "bytes_per_pass": 4194304,
+    "passes": 64,
+    "scalar_time_ms": [
+      52.276,
+      38.752
+    ],
+    "bulk_time_ms": [
+      20.395,
+      20.878
+    ],
+    "status": "byte-identical CPU-only control, not live frame-pacing evidence"
+  }
+}

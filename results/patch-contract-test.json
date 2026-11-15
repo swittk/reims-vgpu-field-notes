@@ -1,0 +1,9 @@
+{
+  "files": 17,
+  "tested_original_files_sha256_match": true,
+  "complete_patch_git_apply_check_pass": true,
+  "complete_patch_postimage_sha256_match": true,
+  "narrow_patch_reverse_forward_cycle_pass": true,
+  "check_is_only_exact_mixed_baseline_not_upstream_HEAD": true,
+  "published_patch_sha256": "e7ae43375c23119957c88de6f84138037f193f6312676ea66dfc61d3b1983695"
+}

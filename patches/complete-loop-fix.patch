@@ -1,0 +1,2000 @@
+--- a/reims/crates/reims-vgpu/src/platform/vulkan/lent_memory.rs
++++ b/reims/crates/reims-vgpu/src/platform/vulkan/lent_memory.rs
+@@ -9,7 +9,7 @@
+ 
+ use reims_vgpu_core::num::ToU64 as _;
+ use reims_vgpu_video_core::device_memory::{
+-    DeviceMemory, DmaBufError, HostView, MemoryIdentity, MemoryLife, SurfaceDmaBuf,
++    DeviceMemory, DmaBufError, HostView, HostViewRequest, MemoryIdentity, MemoryLife, SurfaceDmaBuf,
+ };
+ use reims_vgpu_video_core::surfaces::SurfaceError;
+ use reims_vgpu_vulkan::os::{DeviceLend, LendRefusal, OsSurface, attachment, lend_to_devices};
+@@ -64,8 +64,19 @@
+         }
+     }
+ 
++    fn host_view_request(&self) -> Result<HostViewRequest, SurfaceError> {
++        // Import is optional: only lend naturally contiguous memory. Do not enqueue synthetic
++        // alias construction for scattered guest pixels whose canonical row-copy path is ready.
++        // The returned hold owns only mapping memory, never a guest-visible IOSurface retain.
++        let view = self.host_view()?;
++        Ok(Box::new(move || Ok(view)))
++    }
++
+     fn host_view(&self) -> Result<HostView, SurfaceError> {
+-        let (first, size, offset) = self.lend.pages();
++        let (first, size, offset) = self
++            .lend
++            .host_import_pages()
++            .map_err(|why| SurfaceError::Unreachable(why.to_owned()))?;
+         let too_large = || SurfaceError::Unreachable("a view past the address space".to_owned());
+         Ok(HostView {
+             first,
+--- a/reims/crates/reims-vgpu-core/src/tasks/local.rs
++++ b/reims/crates/reims-vgpu-core/src/tasks/local.rs
+@@ -747,6 +747,24 @@
+         self.on_platform(|| self.buffer_for_page(hold, page, length, true))
+     }
+ 
++    fn backing_upload_binding(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        self.on_platform(|| self.upload_binding_for_page(hold, page, length))
++    }
++
++    fn new_backing_upload_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        self.on_platform(|| self.upload_snapshot_for_page(hold, page, length))
++    }
++
+     fn guest_write_ranges(
+         &self,
+         hold: Hold<'_>,
+--- a/reims/crates/reims-vgpu-core/src/tasks/local/memory.rs
++++ b/reims/crates/reims-vgpu-core/src/tasks/local/memory.rs
+@@ -347,6 +347,116 @@
+             },
+         )?;
+         Ok(complete.then(|| crate::external_writes::CanonicalRanges::new(ranges)))
++    }
++
++    /// Resolve an internal backing without building the expensive contiguous VM alias. Only
++    /// map-backed tasks and an explicitly supporting backend use snapshots; the native host
++    /// blocks setup, missing maps and other backends preserve their established transfer path.
++    pub(super) fn upload_binding_for_page(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        if matches!(self.backend, Backend::Blocks { .. })
++            || !self
++                .base
++                .mtl_device
++                .as_deref()
++                .is_some_and(|d| d.supports_internal_backing_upload())
++        {
++            return Ok(None);
++        }
++        check_mappable(
++            page_address(page),
++            length,
++            self.length,
++            !self.task_root.is_null(),
++        )?;
++        self.backing_write_ranges(hold, page, length)
++    }
++
++    /// Copy each canonical guest page straight into the fresh backend-owned upload allocation.
++    /// The task/page-table hold and upgraded device remain live throughout this synchronous
++    /// read. Unlike the generic best-effort data reader, a missing page refuses the entire
++    /// snapshot: it can never silently pack a following page into the missing page's position.
++    pub(super) fn upload_snapshot_for_page(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        if matches!(self.backend, Backend::Blocks { .. }) {
++            return Ok(None);
++        }
++        let Some(gpu) = self.base.mtl_device.as_deref() else {
++            return Ok(None);
++        };
++        if !gpu.supports_internal_backing_upload() {
++            return Ok(None);
++        }
++        let offset = page_address(page);
++        check_mappable(offset, length, self.length, !self.task_root.is_null())?;
++        let Some(walker) = &self.walker else {
++            return Ok(None);
++        };
++        let Some(device) = self.device.upgrade() else {
++            return Ok(None);
++        };
++        // Resolve and retain the ordinary host RAM map once for the whole upload. Calling
++        // the structured physical reader for every page also performs a scalar volatile
++        // copy per eight bytes; that protocol behavior is unnecessary for pixel payloads.
++        let Some(map) = device.memory_map() else {
++            return Ok(None);
++        };
++        gpu.new_internal_backing_upload(length, &mut |dst| {
++            if dst.len().to_u64() != length {
++                return raise_caught(
++                    RaiseKind::Buffer,
++                    "the backend's upload allocation has the wrong length",
++                );
++            }
++            let mut copied = 0u64;
++            walker.visit_pages_in_range(
++                hold,
++                OnFault::Return,
++                offset,
++                length,
++                &mut |address, physical, _writable| {
++                    let Some(start) = address.checked_sub(offset).filter(|start| *start == copied)
++                    else {
++                        return raise_caught(
++                            RaiseKind::Mapping,
++                            "backing upload page order is incomplete",
++                        );
++                    };
++                    let Some(end) = start.checked_add(PAGE).filter(|end| *end <= length) else {
++                        return raise_caught(
++                            RaiseKind::Mapping,
++                            "backing upload page exceeds its allocation",
++                        );
++                    };
++                    let Some(into) = dst.get_mut(start.to_usize()..end.to_usize()) else {
++                        return raise_caught(
++                            RaiseKind::Mapping,
++                            "backing upload page is outside the allocation",
++                        );
++                    };
++                    if !map.read_upload(page_address(physical), into) {
++                        return raise_caught(
++                            RaiseKind::Mapping,
++                            "backing upload page is not readable",
++                        );
++                    }
++                    copied = end;
++                    Ok(true)
++                },
++            )?;
++            if copied != length {
++                return raise_caught(RaiseKind::Mapping, "backing upload did not read every page");
++            }
++            Ok(())
++        })
+     }
+ 
+     /// A no-copy buffer over the task's pages from `page`, `length` bytes. In the blocks setup
+--- a/reims/crates/reims-vgpu-core/src/memory/map.rs
++++ b/reims/crates/reims-vgpu-core/src/memory/map.rs
+@@ -485,6 +485,41 @@
+         !source.is_null()
+     }
+ 
++    /// Snapshot ordinary mapped guest RAM into a fresh internal upload allocation. This is
++    /// deliberately separate from read(): structured guest fields keep their ordered volatile
++    /// access/fault behavior. Pixel bytes need no per-word protocol semantics or atomic snapshot;
++    /// their external-write generation is checked around the entire upload by BackingResource.
++    ///
++    /// The caller retains its device/task guards and this map throughout the synchronous read.
++    /// Only a complete, single mapped RAM range is accepted, and the owned destination must be
++    /// disjoint. No source reference is created, so external guest storage is never represented
++    /// as an immutable Rust slice. Missing/cross-boundary/overlapping ranges are refused before
++    /// any write, preserving the caller's ordinary fallible mapped-buffer fallback.
++    pub(crate) fn read_upload(&self, physical: u64, dst: &mut [u8]) -> bool {
++        let source = self.virtual_address_for_physical(physical, dst.len().to_u64());
++        if source.is_null() {
++            return false;
++        }
++        if dst.is_empty() {
++            return true;
++        }
++        let first = source.addr();
++        let destination = dst.as_mut_ptr().addr();
++        let Some(source_end) = first.checked_add(dst.len()) else {
++            return false;
++        };
++        let Some(destination_end) = destination.checked_add(dst.len()) else {
++            return false;
++        };
++        if first < destination_end && destination < source_end {
++            return false;
++        }
++        // Raw guest accesses stay in the crate's single audited guest/ptr boundary. This
++        // layer proves ordinary map coverage, destination bounds and disjointness only.
++        crate::guest::GuestPtr::new(source).copy_upload_to(dst, DeathKind::MapReadFault);
++        true
++    }
++
+     /// Where `length` bytes from guest physical `physical` are mapped here; NULL when no range
+     /// holds them.
+     pub fn virtual_address_for_physical(&self, physical: u64, length: u64) -> HostPtr {
+@@ -616,6 +651,122 @@
+             .collect()
+     }
+ 
++    #[test]
++    fn upload_bulk_matches_field_reader_at_unaligned_edges_and_exact_end() {
++        let p = plat();
++        let (ram, m) = ram_map(&p, &[(0x4000, 0x10000)]);
++        let expected = pattern(0x10000, 91);
++        assert!(ram.write(0x4000, &expected));
++        for offset in [0usize, 1, 2, 3, 7, 15, 31, 255, 4095, 16383, 65535] {
++            for count in [
++                0usize,
++                1,
++                2,
++                7,
++                8,
++                15,
++                16,
++                31,
++                64,
++                127,
++                4096,
++                16384,
++                65536 - offset,
++            ] {
++                if offset + count > expected.len() {
++                    continue;
++                }
++                let mut old = vec![0xa7; count];
++                let mut fast = vec![0xa7; count];
++                assert!(m.read(0x4000 + offset as u64, &mut old));
++                assert!(m.read_upload(0x4000 + offset as u64, &mut fast));
++                assert_eq!(old, expected[offset..offset + count]);
++                assert_eq!(fast, old);
++            }
++        }
++        assert!(vm_calls(&p).is_empty(), "bulk copies never create aliases");
++    }
++
++    #[test]
++    fn upload_bulk_refuses_missing_straddling_and_overflow_before_writing() {
++        let p = plat();
++        let (_ram, m) = ram_map(&p, &[(0x4000, PAGE), (0x8000, PAGE)]);
++        for (physical, length) in [
++            (0, 1usize),
++            (0x3fff, 1),
++            (0x7fff, 2),
++            (0xbfff, 2),
++            (u64::MAX, 2),
++        ] {
++            let mut target = vec![0x7b; length];
++            assert!(!m.read_upload(physical, &mut target));
++            assert!(target.iter().all(|b| *b == 0x7b));
++        }
++        assert!(!m.read_upload(u64::MAX, &mut []));
++    }
++
++    #[test]
++    fn upload_bulk_refuses_overlap_without_mutating_guest_bytes() {
++        let p = plat();
++        let expected = pattern(PAGE as usize, 13);
++        let mut bytes = expected.clone();
++        let host = HostPtr::from_ptr(bytes.as_mut_ptr());
++        // Keep the vector alive behind this descriptor; neither the map nor this test needs
++        // to create a second reference into it. The source is rejected before raw access.
++        let map = Map::new(p, &desc(&[gpr(0x4000, PAGE, host)])).unwrap();
++        for offset in [0usize, 1, 7, 63] {
++            assert!(!map.read_upload(0x4000, &mut bytes[offset..offset + 64]));
++        }
++        assert_eq!(bytes, expected);
++    }
++
++    #[test]
++    fn upload_bulk_reflects_new_bytes_and_keeps_independent_snapshots() {
++        let p = plat();
++        let (ram, m) = ram_map(&p, &[(0x4000, PAGE)]);
++        let first = pattern(PAGE as usize, 7);
++        let second = pattern(PAGE as usize, 54);
++        assert!(ram.write(0x4000, &first));
++        let mut a = vec![0; first.len()];
++        assert!(m.read_upload(0x4000, &mut a));
++        assert!(ram.write(0x4000, &second));
++        let mut b = vec![0; second.len()];
++        assert!(m.read_upload(0x4000, &mut b));
++        assert_eq!(a, first);
++        assert_eq!(b, second);
++    }
++
++    #[test]
++    #[ignore = "finite CPU comparison, never run during live playback measurements"]
++    fn upload_bulk_copy_timing_matches_original_bytes() {
++        use std::{hint::black_box, time::Instant};
++        let p = plat();
++        let size = 4 * 1024 * 1024usize;
++        let (ram, m) = ram_map(&p, &[(0x4000, size as u64)]);
++        let expected = pattern(size, 57);
++        assert!(ram.write(0x4000, &expected));
++        let mut destination = vec![0; size];
++        let mut results = Vec::new();
++        for fast in [false, true, false, true] {
++            let began = Instant::now();
++            for _ in 0..64 {
++                for (index, into) in destination.chunks_mut(PAGE as usize).enumerate() {
++                    let physical = black_box(0x4000 + index as u64 * PAGE);
++                    assert!(if fast {
++                        m.read_upload(physical, into)
++                    } else {
++                        m.read(physical, into)
++                    });
++                }
++                black_box(&destination);
++            }
++            let ms = began.elapsed().as_secs_f64() * 1000.;
++            assert_eq!(destination, expected);
++            results.push((fast, ms));
++        }
++        println!("UPLOAD_COPY_TIMING bytesPerPass={size} passes=64 results={results:?}");
++    }
++
+     mod new {
+         use super::*;
+ 
+--- a/reims/crates/reims-vgpu-core/src/resources/host.rs
++++ b/reims/crates/reims-vgpu-core/src/resources/host.rs
+@@ -84,6 +84,32 @@
+         self.new_buffer_for_virtual_page(hold, page, length)
+     }
+ 
++    /// Opt into snapshot uploads for this internal backing only after its current guest page
++    /// binding is validated and observable. None preserves the original no-copy buffer path.
++    /// This does not authorize changing guest buffers, heaps or writable texture semantics.
++    fn backing_upload_binding(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        let _ = (hold, page, length);
++        Ok(None)
++    }
++
++    /// An owned, fresh snapshot of the backing's current guest bytes for one upload. The
++    /// encoder's copy command retains the returned buffer. No source view or guest object is
++    /// retained after this call. None falls back to the ordinary mapped transfer buffer.
++    fn new_backing_upload_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        let _ = (hold, page, length);
++        Ok(None)
++    }
++
+     /// Canonical host-RAM bytes underlying this binding, for observing completed writes
+     /// from another host device. Platforms without this integration retain their old policy.
+     fn guest_write_ranges(
+--- a/reims/crates/reims-vgpu-core/src/resources/texture/backing.rs
++++ b/reims/crates/reims-vgpu-core/src/resources/texture/backing.rs
+@@ -119,6 +119,9 @@
+     planes: Vec<BackingPlane>,
+     /// The guest pages: dropped by a discard, bound again by the next paging.
+     transfer_buffer: Mutex<Option<P::Buffer>>,
++    /// Forward paging may use a fresh owned upload snapshot. Reverse paging always retains
++    /// the original mapped guest buffer, created lazily only if a GPU writeback is requested.
++    snapshot_upload: bool,
+     /// Observed external writes for this transfer binding, and the generation prepared.
+     external: Mutex<Option<(Arc<crate::external_writes::WriteWatch>, u64)>>,
+     /// Every discarded binding needs a new physical-page identity check before cache reuse.
+@@ -185,28 +188,45 @@
+             // Trace `tobj`: the guest object whose pages the next `tbuf` imports (6, a new shared
+             // texture backing), its page and its length.
+             crate::trace::event("tobj", &[6, u64::from(page), length]);
+-            let transfer_buffer = match &host {
+-                Some(t) => match t.new_backing_buffer_for_virtual_page(hold, page, length) {
+-                    Ok(b) => Some(b),
+-                    Err(e) => {
+-                        // The task's raise releases the half-made backing's IOSurface, which is
+-                        // ours alone: no Metal object, no table and no lookup reaches it.
++            let upload_binding = match &host {
++                Some(t) => match t.backing_upload_binding(hold, page, length) {
++                    Ok(binding) => binding,
++                    Err(error) => {
+                         drop(io_surface);
+-                        return Err(e);
++                        return Err(error);
+                     }
+                 },
+                 None => None,
+             };
+-            let Some(transfer_buffer) = transfer_buffer else {
+-                drop(io_surface);
+-                return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
++            let snapshot_upload = upload_binding.is_some();
++            let transfer_buffer = if snapshot_upload {
++                // The validated canonical binding is enough for an owned upload. Constructing
++                // a no-copy guest alias here would reintroduce the transition-time stall.
++                None
++            } else {
++                match &host {
++                    Some(t) => match t.new_backing_buffer_for_virtual_page(hold, page, length) {
++                        Ok(buffer) => Some(buffer),
++                        Err(error) => {
++                            drop(io_surface);
++                            return Err(error);
++                        }
++                    },
++                    None => {
++                        drop(io_surface);
++                        return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
++                    }
++                }
+             };
+-            let external = match &host {
+-                Some(t) => t
+-                    .guest_write_ranges(hold, page, length)?
+-                    .map(|ranges| (crate::external_writes::process().watch(ranges), 0)),
+-                None => None,
++            let observed = match upload_binding {
++                Some(ranges) => Some(ranges),
++                None => match &host {
++                    Some(t) => t.guest_write_ranges(hold, page, length)?,
++                    None => None,
++                },
+             };
++            let external =
++                observed.map(|ranges| (crate::external_writes::process().watch(ranges), 0));
+             let mut textures: Vec<P::Texture> = Vec::with_capacity(plane_count);
+             // One descriptor for every plane: made from the first plane's value, then each later
+             // plane's size, usage and pixel format set on it.
+@@ -269,7 +289,8 @@
+                     task,
+                     io_surface,
+                     planes: own,
+-                    transfer_buffer: Mutex::new(Some(transfer_buffer)),
++                    transfer_buffer: Mutex::new(transfer_buffer),
++                    snapshot_upload,
+                     external: Mutex::new(external),
+                     discarded: AtomicU64::new(0),
+                     checked_discard: AtomicU64::new(0),
+@@ -311,6 +332,14 @@
+         });
+         if !same {
+             this.state.set_host_valid(false);
++            if self.snapshot_upload {
++                // Snapshot uploads deliberately do not call ensure_physical. Update their
++                // observer here so a changed page binding never keeps watching the old pages.
++                let fresh =
++                    current.map(|ranges| (crate::external_writes::process().watch(ranges), 0));
++                let old = std::mem::replace(&mut *self.external.lock(), fresh);
++                drop(old);
++            }
+         }
+         self.checked_discard.store(discarded, Ordering::Release);
+         Ok(())
+@@ -437,7 +466,9 @@
+         encoder: Option<&P::BlitEncoder>,
+     ) -> RaiseResult<()> {
+         let state = &this.state;
+-        if state.host_valid() && state.guest_valid() {
++        if state.guest_valid()
++            && (state.host_valid() || (self.snapshot_upload && self.binding_needs_check()))
++        {
+             self.check_discarded_binding(hold, this)?;
+         }
+         if self.is_host_valid(this) {
+@@ -446,13 +477,40 @@
+         if !state.guest_valid() {
+             log::warn!("preparing a backing whose guest copy is not valid");
+         }
+-        let transfer_buffer = self.ensure_physical(hold)?;
+-        // Capture BEFORE recording; a writer racing the blit remains dirty for the next use.
+-        let prepared = self
+-            .external
+-            .lock()
+-            .as_ref()
+-            .map(|(watch, _)| (Arc::clone(watch), watch.generation()));
++        // Capture the generation BEFORE an owned snapshot reads its source pages. A writer
++        // racing that CPU copy must leave the texture dirty for its next use, even if all its
++        // writes happened before the copy command was recorded.
++        let before_snapshot = self
++            .snapshot_upload
++            .then(|| {
++                self.external
++                    .lock()
++                    .as_ref()
++                    .map(|(watch, _)| (Arc::clone(watch), watch.generation()))
++            })
++            .flatten();
++        let snapshot = if self.snapshot_upload {
++            match self.task.upgrade() {
++                Some(task) => task.new_backing_upload_buffer(hold, self.page, self.length)?,
++                None => None,
++            }
++        } else {
++            None
++        };
++        let used_snapshot = snapshot.is_some();
++        let transfer_buffer = match snapshot {
++            Some(buffer) => buffer,
++            None => self.ensure_physical(hold)?,
++        };
++        let prepared = if used_snapshot {
++            before_snapshot
++        } else {
++            // The fallback may have rebound the pages and installed a new write watch.
++            self.external
++                .lock()
++                .as_ref()
++                .map(|(watch, _)| (Arc::clone(watch), watch.generation()))
++        };
+         let buffer = &transfer_buffer;
+         for (plane, texture) in self.planes.iter().zip(&self.textures) {
+             // The form without options.
+@@ -638,6 +696,209 @@
+         )
+         .unwrap()
+         .unwrap()
++    }
++
++    fn snapshot_ranges(which: u64) -> crate::external_writes::CanonicalRanges {
++        let at = 0x7000_0000_0000 + which * 0x10000;
++        crate::external_writes::CanonicalRanges::new(vec![at..at + 0x1000])
++    }
++
++    #[test]
++    fn snapshot_creation_and_upload_avoid_the_mapped_transfer_buffer() {
++        let old = Env::new();
++        let old_r = make(&old);
++        assert!(backing(&old_r).transfer_buffer.lock().is_some());
++        assert_eq!(
++            old.p
++                .call_log()
++                .since(0)
++                .iter()
++                .filter(|x| x.sel == "new_buffer_for_virtual_page")
++                .count(),
++            1
++        );
++
++        let env = Env::new();
++        env.rec.set_backing_upload_binding(snapshot_ranges(1));
++        let r = make(&env);
++        assert!(backing(&r).snapshot_upload);
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        let calls = log.since(mark);
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|x| x.sel == "new_backing_upload_buffer")
++                .count(),
++            1
++        );
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|x| x.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        assert!(calls.iter().all(|x| x.sel != "new_buffer_for_virtual_page"));
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++        assert!(r.is_host_valid());
++    }
++
++    #[test]
++    fn snapshot_upload_takes_a_new_owned_buffer_after_each_completed_write() {
++        let env = Env::new();
++        let ranges = snapshot_ranges(2);
++        env.rec.set_backing_upload_binding(ranges.clone());
++        let r = make(&env);
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        crate::external_writes::process().completed_write(&ranges);
++        assert!(!r.is_host_valid());
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        let copies: Vec<_> = log
++            .since(mark)
++            .into_iter()
++            .filter(|x| x.sel.starts_with("copyFromBuffer:"))
++            .collect();
++        assert_eq!(copies.len(), 4);
++        assert_ne!(copies[0].args[0], copies[2].args[0]);
++        assert!(r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++    }
++
++    #[test]
++    fn snapshot_upload_does_not_acknowledge_a_writer_racing_the_read() {
++        let env = Env::new();
++        let ranges = snapshot_ranges(3);
++        env.rec.set_backing_upload_binding(ranges.clone());
++        let r = make(&env);
++        env.rec.during_next("new_backing_upload_buffer", move || {
++            crate::external_writes::process().completed_write(&ranges);
++        });
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.state.host_valid());
++        assert!(
++            !r.is_host_valid(),
++            "a racing writer remains dirty for the next upload"
++        );
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++    }
++
++    #[test]
++    fn snapshot_discard_rebinds_observation_without_retaining_old_guest_pages() {
++        let env = Env::new();
++        let old = snapshot_ranges(4);
++        let fresh = snapshot_ranges(5);
++        env.rec.set_backing_upload_binding(old.clone());
++        let r = make(&env);
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        r.discard().unwrap();
++        env.rec.set_backing_upload_binding(fresh.clone());
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++        assert!(
++            backing(&r)
++                .external
++                .lock()
++                .as_ref()
++                .unwrap()
++                .0
++                .same_binding(&fresh)
++        );
++        crate::external_writes::process().completed_write(&old);
++        assert!(r.is_host_valid());
++        crate::external_writes::process().completed_write(&fresh);
++        assert!(!r.is_host_valid());
++    }
++
++    #[test]
++    fn snapshot_gpu_writeback_still_uses_the_real_guest_mapping() {
++        let env = Env::new();
++        env.rec.set_backing_upload_binding(snapshot_ranges(6));
++        let r = make(&env);
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        r.state.set_guest_valid(false);
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.synchronize_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        let calls = log.since(mark);
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|x| x.sel == "new_buffer_for_virtual_page")
++                .count(),
++            1
++        );
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|x| x.sel.starts_with("copyFromTexture:"))
++                .count(),
++            2
++        );
++        assert!(calls.iter().all(|x| x.sel != "new_backing_upload_buffer"));
++        assert!(backing(&r).transfer_buffer.lock().is_some());
++        assert!(r.state.guest_valid());
++    }
++
++    #[test]
++    fn snapshot_discard_never_overwrites_gpu_authoritative_pixels() {
++        let env = Env::new();
++        env.rec.set_backing_upload_binding(snapshot_ranges(8));
++        let r = make(&env);
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        r.state.set_guest_valid(false);
++        r.discard().unwrap();
++        env.rec.set_backing_upload_binding(snapshot_ranges(9));
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert!(!r.state.guest_valid());
++        assert!(
++            log.since(mark)
++                .iter()
++                .all(|call| call.sel != "new_backing_upload_buffer"
++                    && !call.sel.starts_with("copyFromBuffer:"))
++        );
++    }
++
++    #[test]
++    fn snapshot_refusal_falls_back_but_a_read_error_is_not_marked_valid() {
++        let env = Env::new();
++        env.rec.set_backing_upload_binding(snapshot_ranges(7));
++        let r = make(&env);
++        env.p.script().push("new_backing_upload_buffer", Step::Nil);
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(backing(&r).transfer_buffer.lock().is_some());
++        assert!(r.is_host_valid());
++        r.state.set_host_valid(false);
++        env.p.script().push(
++            "new_backing_upload_buffer",
++            Step::raise("NSGenericException", "unreadable source"),
++        );
++        assert!(
++            r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++                .is_err()
++        );
++        assert!(!r.state.host_valid());
+     }
+ 
+     /// The two bit-fields of the last word
+@@ -1452,6 +1713,7 @@
+             io_surface: None,
+             planes: vec![plane(0, 1, 1, 4, 4)],
+             transfer_buffer: Mutex::new(None),
++            snapshot_upload: false,
+             external: Mutex::new(None),
+             discarded: AtomicU64::new(0),
+             checked_discard: AtomicU64::new(0),
+--- a/reims/crates/reims-vgpu-core/src/platform/device.rs
++++ b/reims/crates/reims-vgpu-core/src/platform/device.rs
+@@ -62,6 +62,27 @@
+         options: u64,
+         deallocator: Option<NoCopyDeallocator>,
+     ) -> RaiseResult<Option<P::Buffer>>;
++    /// Internal paging capability, not a guest Metal selector. A backend may upload a
++    /// snapshot of scattered guest bytes without importing a contiguous alias of those pages.
++    /// The original mapped-buffer path remains the default on other platforms.
++    fn supports_internal_backing_upload(&self) -> bool {
++        false
++    }
++
++    /// Make a fresh, owned, immutable-for-this-command upload buffer. `fill` runs exactly once
++    /// before any GPU command can reference the buffer, and must finish synchronously. The
++    /// returned object owns its bytes independently of the source guest pages; an encoder must
++    /// retain it through completion. It is never handed to the guest or used for GPU writeback.
++    /// None retains the existing mapped transfer fallback; a fill error must be propagated.
++    fn new_internal_backing_upload(
++        &self,
++        length: u64,
++        fill: &mut dyn FnMut(&mut [u8]) -> RaiseResult<()>,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        let _ = (length, fill);
++        Ok(None)
++    }
++
+     /// sel: newBufferWithIOSurface: SPI — The buffer retains
+     /// the surface (a guest-visible count).
+     fn new_buffer_on_surface(
+--- a/reims/crates/reims-vgpu-core/src/testkit/resource_host.rs
++++ b/reims/crates/reims-vgpu-core/src/testkit/resource_host.rs
+@@ -46,6 +46,8 @@
+     features: Mutex<Option<FeaturesRef>>,
+     provided: Mutex<Vec<(u64, AnyHandle)>>,
+     paging_queue: Mutex<Option<Fk<kind::CommandQueue>>>,
++    /// Explicit opt-in for internal-backing snapshot tests. Default keeps old call logs.
++    upload_binding: Mutex<Option<crate::external_writes::CanonicalRanges>>,
+     /// What runs inside the next call of a selector, once (a racing caller's whole call).
+     during: Mutex<Vec<During>>,
+ }
+@@ -76,9 +78,16 @@
+                 features: Mutex::new(None),
+                 provided: Mutex::new(Vec::new()),
+                 paging_queue: Mutex::new(None),
++                upload_binding: Mutex::new(None),
+                 during: Mutex::new(Vec::new()),
+             }),
+         })
++    }
++
++    /// Enable the internal snapshot path with an observed canonical binding. Tests may update
++    /// the binding after a discard; ordinary tests keep the existing mapped-buffer behavior.
++    pub fn set_backing_upload_binding(&self, ranges: crate::external_writes::CanonicalRanges) {
++        *self.shared.upload_binding.lock() = Some(ranges);
+     }
+ 
+     /// Another handle on the same state: a second task object whose last release a test
+@@ -177,6 +186,51 @@
+ }
+ 
+ impl ResourceHost<P> for FakeResourceHost {
++    fn backing_upload_binding(
++        &self,
++        _hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        let ranges = self.shared.upload_binding.lock().clone();
++        if ranges.is_none() {
++            return Ok(None);
++        }
++        self.thr(
++            Policy::Caught,
++            "backing_upload_binding",
++            vec![Arg::U32(page), Arg::U64(length)],
++            || ranges,
++        )
++    }
++
++    fn new_backing_upload_buffer(
++        &self,
++        _hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<Fk<kind::Buffer>>> {
++        if self.shared.upload_binding.lock().is_none() {
++            return Ok(None);
++        }
++        let step = self.step(
++            "new_backing_upload_buffer",
++            vec![Arg::U32(page), Arg::U64(length)],
++        );
++        let is_nil = step.is_nil();
++        step.throws(Policy::Caught, "new_backing_upload_buffer")?;
++        if is_nil {
++            return Ok(None);
++        }
++        Ok(super::impls::new_buffer(
++            self.shared.platform.world(),
++            length,
++            0,
++            super::impls::Backing::Fresh,
++            None,
++        ))
++    }
++
+     fn guest_write_ranges(
+         &self,
+         _hold: Hold<'_>,
+@@ -187,7 +241,7 @@
+             Policy::Caught,
+             "guest_write_ranges",
+             vec![Arg::U32(page), Arg::U64(length)],
+-            || None,
++            || self.shared.upload_binding.lock().clone(),
+         )
+     }
+ 
+--- a/reims/crates/reims-vgpu-video-core/src/device_memory.rs
++++ b/reims/crates/reims-vgpu-video-core/src/device_memory.rs
+@@ -195,6 +195,16 @@
+         ))
+     }
+ 
++    /// Prepare an owned request for a contiguous view without keeping a guest-visible surface
++    /// reference. Optional import workers resolve this after admission, so a platform may defer
++    /// expensive scatter-gather mapping instead of blocking a decoded frame. The request must
++    /// keep its backing memory alive independently of this borrowed DeviceMemory. Platforms
++    /// without deferred mapping retain their existing eager host_view behavior by default.
++    fn host_view_request(&self) -> Result<HostViewRequest, SurfaceError> {
++        let view = self.host_view()?;
++        Ok(Box::new(move || Ok(view)))
++    }
++
+     /// On macOS, the host's IOSurface over the surface's pages, for a
+     /// backend whose device writes IOSurfaces (VideoToolbox's pixel
+     /// transfer), lent for as long as this memory lives, which is the
+@@ -323,6 +333,10 @@
+     #[error("{0}")]
+     Refused(String),
+ }
++
++/// An independently owned, one-shot view preparation operation for an existing import worker.
++/// Resolving it can fail; a decoder must keep its ordinary CPU copy fallback in that case.
++pub type HostViewRequest = Box<dyn FnOnce() -> Result<HostView, SurfaceError> + Send>;
+ 
+ /// A view of a surface's whole pages in the host's address space
+ /// ([`DeviceMemory::host_view`]), mapped while `hold` lives.
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux.rs
+@@ -34,7 +34,7 @@
+ };
+ pub(crate) use surface::{
+     base_views_pages, borrow_shared_mapping, create_shared_mapping, own_alias, plane_at,
+-    plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix,
++    plane_shape, recorded_mut, surface_memory_hold, tracking_base_address, ycbcr_matrix,
+ };
+ pub(crate) use vm::allocate_aliasable;
+ #[cfg(test)]
+--- a/reims/crates/reims-vgpu-vulkan/src/os/surface.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/surface.rs
+@@ -91,6 +91,21 @@
+     })
+ }
+ 
++/// A stable numerical address for tracking, not a request to dereference its bytes. Linux
++/// may still hold only the reservation; canonical guest ranges are already usable. Keeping
++/// metadata queries separate prevents an observer or write notification from creating an
++/// otherwise unnecessary per-page CPU alias on the critical frame path.
++fn tracking_base(surface: &OsSurface) -> u64 {
++    #[cfg(target_os = "linux")]
++    {
++        host_os::tracking_base_address(surface)
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        surface.base_address().as_ptr::<u8>().addr().to_u64()
++    }
++}
++
+ /// The host memory a surface's bytes are over: its allocation in its own mapping (its
+ /// allocation size from its base address less its `kIOSurfaceOffset`), and, for one
+ /// `OsSurfaces::create` made over the guest's pages (`kIOSurfaceClientAddressRanges`),
+@@ -104,7 +119,7 @@
+ /// write through it shows in the pages at that offset (measured on the M3 Max, offsets 0x40,
+ /// 0x1000 and 0x4000).
+ pub(crate) fn surface_memory(surface: &OsSurface) -> Vec<std::ops::Range<u64>> {
+-    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    let base = tracking_base(surface);
+     let own = |offset: u64| {
+         let first = base.saturating_sub(offset);
+         first..first.saturating_add(surface.alloc_size())
+@@ -123,7 +138,7 @@
+     surface: &OsSurface,
+     offsets: &[std::ops::Range<u64>],
+ ) -> Vec<std::ops::Range<u64>> {
+-    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    let base = tracking_base(surface);
+     let own = offsets
+         .iter()
+         .map(|o| base.saturating_add(o.start)..base.saturating_add(o.end));
+@@ -264,7 +279,7 @@
+ /// not, has a mapping of its own (measured on the M3 Max: one of 4 contiguous pages), read-only
+ /// for a surface of [`gpu_read_only`].
+ pub(crate) fn base_in_pages(surface: &OsSurface) -> bool {
+-    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    let base = tracking_base(surface);
+     recorded(surface, |made| {
+         made.pages.iter().any(|run| run.contains(&base))
+     })
+@@ -437,7 +452,7 @@
+     required_length: usize,
+     regions: &[(usize, &[u8])],
+ ) -> Result<(), &'static str> {
+-    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    let base = tracking_base(surface);
+     if surface.protection_options() != 0 || base == 0 {
+         return Err("a protected surface, whose memory the CPU never reaches");
+     }
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
+@@ -279,6 +279,188 @@
+     fill_fresh_view(at, length, tail, pieces, file_no_replace)
+ }
+ 
++/// Install an already-validated captured file layout at a fresh unpublished address.
++/// Reuses the established NOREPLACE path; the original tracking reservation stays intact,
++/// so address collisions can fall back without ever clobbering foreign mappings.
++fn fresh_captured_view(pieces: &[files::Piece], length: u64, tail: u64) -> Option<u64> {
++    let pieces = pieces.to_vec();
++    // Allocate BOTH owned vectors before opening the address hole. Cloning after munmap
++    // could let the process allocator claim part of that hole, forcing the slow fallback.
++    let fallback_pieces = pieces.clone();
++    let whole = length.checked_add(tail)?;
++    usize::try_from(whole).ok()?;
++    budget::admit(mappings_added(&pieces), "a fresh view of guest pages");
++    // Admission can wait for retired space and must precede the installation hold. A whole
++    // unpublished view installs before another retirement piece enters the kernel; otherwise
++    // thousands of tiny mappings are delayed by every old view being released concurrently.
++    let _installation = ALIAS_INSTALLATION.lock();
++    // Everything that can allocate a vector or discover a file runs before opening the hole.
++    let at = anonymous(None, whole, "a fresh view reservation").ok()?;
++    // SAFETY: this call exclusively owns an unpublished anonymous reservation. Nothing has
++    // imported it or been told its address. The optional tail is left reserved.
++    if unsafe { libc::munmap(ptr(at), length.to_usize()) } != 0 {
++        // SAFETY: reservation remains ours when the kernel refused the unmap.
++        let _ = unsafe { libc::munmap(ptr(at), whole.to_usize()) };
++        return None;
++    }
++    if let Some(first) = fill_fresh_view(at, length, tail, pieces, file_no_replace) {
++        return Some(first);
++    }
++    // The collision-safe attempt cleaned only what it owned. Reserve another whole range
++    // and use the existing overwrite fallback exclusively inside that new owned allocation.
++    let at = anonymous(None, whole, "a deferred view fallback").ok()?;
++    for piece in &fallback_pieces {
++        if file(
++            Some(at + piece.at),
++            piece.length,
++            &piece.backing,
++            piece.prot,
++        )
++        .is_err()
++        {
++            // No address is published, and the whole reservation is still ours.
++            let _ = unsafe { libc::munmap(ptr(at), whole.to_usize()) };
++            return None;
++        }
++    }
++    files::record_pieces(at, fallback_pieces);
++    Some(at)
++}
++
++/// An owned address reservation whose scatter-gather file mapping is needed only by a
++/// consumer that actually requests a contiguous CPU/device pointer. A decoder can copy into
++/// the canonical guest ranges without creating thousands of VMAs first. The complete backing
++/// file sequence is captured at construction, as for an eager alias: remaps of the source
++/// virtual addresses cannot silently change which files this view represents.
++///
++/// This owns no physical-page pins or guest objects. MAP_SHARED still follows hole punching
++/// and later writes to the files. The enclosing Memory owns both the inaccessible identity
++/// reservation and, once created, the separate immutable realized mapping.
++#[derive(Debug)]
++pub(super) struct DeferredView {
++    first: u64,
++    length: u64,
++    tail: u64,
++    read_only: bool,
++    pieces: Vec<files::Piece>,
++    ready: std::sync::OnceLock<Result<u64, KernReturn>>,
++}
++
++impl DeferredView {
++    /// Validate the same whole-page layout as a normal view and reserve its address, without
++    /// installing any per-page mappings. A non-readable reservation prevents accidental use
++    /// of an unprepared pointer; only tracking code may read its numerical address.
++    pub(super) fn new(
++        ranges: &[std::ops::Range<u64>],
++        length: u64,
++        tail: u64,
++        read_only: bool,
++    ) -> Option<Self> {
++        let page = page_size();
++        if length == 0 || length % page != 0 || tail % page != 0 {
++            return None;
++        }
++        let pieces = files::pieces_for_ranges(ranges, length)?;
++        if pieces.is_empty()
++            || pieces.iter().any(|p| {
++                p.length == 0
++                    || p.length % page != 0
++                    || p.at % page != 0
++                    || p.backing.offset % page != 0
++                    || libc::off_t::try_from(p.backing.offset).is_err()
++            })
++        {
++            return None;
++        }
++        let whole = length.checked_add(tail)?;
++        usize::try_from(whole).ok()?;
++        budget::admit(1, "a deferred surface view reservation");
++        let first = anonymous(None, whole, "a deferred surface view reservation").ok()?;
++        // SAFETY: the fresh unpublished reservation belongs exclusively to this constructor.
++        if unsafe { libc::mprotect(ptr(first), whole.to_usize(), libc::PROT_NONE) } != 0 {
++            // SAFETY: no pointer or mapping has escaped this constructor.
++            let _ = unsafe { libc::munmap(ptr(first), whole.to_usize()) };
++            return None;
++        }
++        Some(Self {
++            first,
++            length,
++            tail,
++            read_only,
++            pieces,
++            ready: std::sync::OnceLock::new(),
++        })
++    }
++
++    /// Its stable reserved identity, never a dereferenceable pointer. The real mapping is
++    /// published separately by realized() only after successful preparation.
++    pub(super) fn first(&self) -> u64 {
++        self.first
++    }
++
++    /// Whether the alias is already usable, without waiting for an ongoing construction.
++    pub(super) fn is_ready(&self) -> bool {
++        matches!(self.ready.get(), Some(Ok(_)))
++    }
++
++    /// An unpublished reservation (including one being prepared) can be shared by exact
++    /// file identity without waiting. No caller receives a dereferenceable pointer early.
++    pub(super) fn is_pending(&self) -> bool {
++        self.ready.get().is_none()
++    }
++
++    /// The actual view, once published. The reserved address is a metadata identity only;
++    /// no dereferenceable pointer is returned until this immutable realized address exists.
++    pub(super) fn realized(&self) -> Option<u64> {
++        self.ready
++            .get()
++            .and_then(|result| result.as_ref().ok().copied())
++    }
++
++    /// Materialize once using fresh address space, before exposing any CPU/device pointer.
++    /// Unlike MAP_FIXED over a long-lived reservation, the proven NOREPLACE path avoids
++    /// thousands of unnecessary unmap/replace operations. The full original file layout,
++    /// protections and lifetime are retained; this does not pin pages or copy their contents.
++    pub(super) fn prepare(&self) -> Result<(), KernReturn> {
++        self.ready
++            .get_or_init(|| {
++                let first = fresh_captured_view(&self.pieces, self.length, self.tail)
++                    .ok_or(INVALID_ARGUMENT)?;
++                let whole = self.length + self.tail;
++                let vm = LinuxVm::new();
++                let at = HostAddr::from_addr(first.to_usize());
++                let complete = (|| {
++                    if self.read_only {
++                        crate::gpu::backing::map_zeros(&vm, at, self.length, whole)
++                            .map_err(|e| e.kr)?;
++                        vm.protect_max(at, whole, VmProt::READ)?;
++                    } else if self.tail != 0 {
++                        let backing = Backing {
++                            fd: memfd(self.tail),
++                            offset: 0,
++                        };
++                        let tail = first + self.length;
++                        file(
++                            Some(tail),
++                            self.tail,
++                            &backing,
++                            libc::PROT_READ | libc::PROT_WRITE,
++                        )?;
++                        files::record(tail, self.tail, backing, libc::PROT_READ | libc::PROT_WRITE);
++                    }
++                    Ok(first)
++                })();
++                if complete.is_err() {
++                    let _ = vm.deallocate(at, whole);
++                }
++                complete
++            })
++            .as_ref()
++            .map(|_| ())
++            .map_err(|error| *error)
++    }
++}
++
+ /// Install one piece only if its address is vacant. Check the returned address as well: older
+ /// kernels may ignore MAP_FIXED_NOREPLACE and place the mapping elsewhere (mmap(2)).
+ fn file_no_replace(at: u64, piece: &files::Piece) -> Option<u64> {
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs
+@@ -33,9 +33,9 @@
+ use super::vm;
+ 
+ /// A surface's bytes lent to a device (module docs).
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct DeviceLend {
+-    /// The host address of the first byte, the surface's base address.
++    /// The stable first-byte address; a scattered alias may still be reserved, not populated.
+     first: NonNull<u8>,
+     /// The bytes, to the allocation's end.
+     length: u64,
+@@ -84,7 +84,8 @@
+ 
+ /// `surface`'s bytes lent to a device (module docs); `Err` with why where they are not lent.
+ pub fn lend_to_devices(surface: &LinuxSurface) -> Result<DeviceLend, &'static str> {
+-    let base = surface.base_address().addr().to_u64();
++    // A lend is a lifetime/identity handle; only its eventual contiguous consumer maps pages.
++    let base = super::surface::reserved_base_address(surface);
+     if surface.protection_options() != 0 || base == 0 {
+         return Err("a protected surface, whose memory the CPU never reaches");
+     }
+@@ -106,10 +107,16 @@
+ }
+ 
+ impl DeviceLend {
+-    /// The host address of the first byte lent, the surface's base address, mapped while the
+-    /// lend or a hold it made lives.
+-    pub fn first(&self) -> NonNull<u8> {
+-        self.first
++    /// Prepare and return the first-byte address. Refuses host mapping failure rather than
++    /// exposing an unpopulated reservation. A successful pointer stays mapped while the lend
++    /// or a hold it made lives.
++    pub fn first(&self) -> Result<NonNull<u8>, &'static str> {
++        let base = self
++            .holder
++            .address(self.first.as_ptr().addr().to_u64())
++            .map_err(|_| "the host refused a contiguous surface view")?;
++        NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(base.to_usize()))
++            .ok_or("the host returned an empty view")
+     }
+ 
+     /// The bytes lent, from [`Self::first`] to the allocation's end.
+@@ -127,23 +134,32 @@
+     /// [`Self::first`] lies in them. They are mapped, contiguous, while the lend or a hold it made
+     /// lives: the surface's view, the run of the guest's pages it lies in, or its own memory, each
+     /// whole pages from below its base address past its allocation's end.
+-    pub fn pages(&self) -> (NonNull<u8>, u64, u64) {
+-        let (start, length) = self.page_range();
+-        let offset = self.first.as_ptr().addr().to_u64() - start;
+-        // SAFETY: `start` is `first` less its offset into its page, in the same mapping.
+-        let at = unsafe { NonNull::new_unchecked(self.first.as_ptr().sub(offset.to_usize())) };
+-        (at, length, offset)
+-    }
+-
+-    /// The first byte and the length of the lent bytes' whole pages.
+-    fn page_range(&self) -> (u64, u64) {
+-        let page = vm::page_size();
+-        let first = self.first.as_ptr().addr().to_u64();
+-        let start = first - first % page;
+-        // The lent bytes end in the surface's mapping, which ends on a page, so this neither
+-        // overflows nor passes it.
+-        let end = (first + self.length).next_multiple_of(page);
+-        (start, end - start)
++    pub fn pages(&self) -> Result<(NonNull<u8>, u64, u64), &'static str> {
++        let first = self.first()?;
++        let page = vm::page_size();
++        let base = first.as_ptr().addr().to_u64();
++        let start = base - base % page;
++        let end = (base + self.length).next_multiple_of(page);
++        let offset = base - start;
++        // SAFETY: first and the page-aligned start belong to the prepared, held mapping.
++        let at = unsafe { NonNull::new_unchecked(first.as_ptr().sub(offset.to_usize())) };
++        Ok((at, end - start, offset))
++    }
++
++    /// Existing contiguous host pages suitable for an optional external-device import.
++    /// Scattered guest pages have a canonical row-copy path already. Manufacturing a second
++    /// contiguous alias and registering every page is extra work, not zero-copy ownership of
++    /// the existing host mapping; it also pins those alias pages for the registration's life.
++    /// Decline it structurally, without mapping anything or consulting a GPU/driver ID.
++    ///
++    /// Explicit CPU pointer consumers retain pages(), and a device that accepts scatter/gather
++    /// keeps dma_buf_of(). Naturally contiguous guest memory and host-owned allocations still
++    /// support direct host registration with exactly their old lifetime and offset semantics.
++    pub fn host_import_pages(&self) -> Result<(NonNull<u8>, u64, u64), &'static str> {
++        if !self.holder.has_native_host_view() {
++            return Err("scattered guest pages need a synthetic alias; use the canonical row copy");
++        }
++        self.pages()
+     }
+ 
+     /// A dma-buf of `ranges` of the lent bytes, each an offset from [`Self::first`] and a length,
+@@ -151,7 +167,12 @@
+     /// them share given once, in one piece (module docs). `Err` with udmabuf's refusal, its limits
+     /// named where they are what refused.
+     pub fn dma_buf_of(&self, ranges: &[(u64, u64)]) -> Result<LentDmaBuf, LendRefusal> {
+-        let first = self.first.as_ptr().addr().to_u64();
++        let first = self
++            .first()
++            .map_err(|why| LendRefusal::Refused(why.to_owned()))?
++            .as_ptr()
++            .addr()
++            .to_u64();
+         let (pages, offsets) = pages_of(first, self.length, vm::page_size(), ranges)
+             .map_err(|why| LendRefusal::Refused(why.to_owned()))?;
+         let size = pages.iter().map(|&(_, length)| length).sum();
+@@ -298,6 +319,92 @@
+         assert!(vm.deallocate(at, length).is_success());
+     }
+ 
++    #[test]
++    fn optional_host_import_does_not_construct_a_scattered_alias() {
++        let page = vm::page_size();
++        let (at, ranges) = scattered_pages(3);
++        let surface = LinuxSurfaces::new().create(&over(&ranges, None)).unwrap();
++        let reserved = super::super::surface::reserved_base_address(&surface) - 0x40;
++        let lend = lend_to_devices(&surface).unwrap();
++        for _ in 0..32 {
++            assert!(lend.host_import_pages().is_err());
++        }
++        assert!(super::super::files::pieces(reserved, page * 3).is_none());
++        assert_eq!(surface.retain_count(), 1);
++        // A caller that explicitly needs CPU-contiguous bytes still gets the exact view.
++        let (first, length, offset) = lend.pages().unwrap();
++        assert_eq!((length, offset), (page * 3, 0x40));
++        let address = first.as_ptr().addr().to_u64();
++        assert_eq!(
++            [
++                read(address),
++                read(address + page),
++                read(address + page * 2)
++            ],
++            [2, 1, 0]
++        );
++        // Cache/readiness must not make import policy depend on unrelated request ordering.
++        assert!(lend.host_import_pages().is_err());
++        drop((lend, surface));
++        free(at, page * 3);
++    }
++
++    #[test]
++    fn optional_host_import_preserves_native_contiguous_guest_pages_and_offset() {
++        let page = vm::page_size();
++        let (at, _) = scattered_pages(3);
++        // A single existing guest mapping, not a new assembled surface view described
++        // by three separate client ranges. The latter must use the tested copy fallback.
++        let ranges = [PhysicalMemoryRange {
++            physical_address: at,
++            physical_length: page * 3,
++        }];
++        let spec = SurfaceSpec {
++            alloc_size: page * 3,
++            ..over(&ranges, None)
++        };
++        let surface = LinuxSurfaces::new().create(&spec).unwrap();
++        let lend = lend_to_devices(&surface).unwrap();
++        let (first, length, offset) = lend.host_import_pages().unwrap();
++        assert_eq!(
++            (first.as_ptr().addr().to_u64(), length, offset),
++            (at, page * 3, 0x40)
++        );
++        let hold = lend.hold();
++        drop((lend, surface));
++        assert_eq!([read(at), read(at + page), read(at + 2 * page)], [0, 1, 2]);
++        drop(hold);
++        free(at, page * 3);
++    }
++
++    #[test]
++    fn optional_host_import_keeps_host_owned_allocation_alive() {
++        let page = vm::page_size();
++        let spec = SurfaceSpec {
++            pixel_format: BGRA,
++            alloc_size: page * 2,
++            offset: 0x40,
++            width: 16,
++            height: 16,
++            bytes_per_element: 4,
++            bytes_per_row: 64,
++            element_width: 1,
++            element_height: 1,
++            ..SurfaceSpec::default()
++        };
++        let surface = LinuxSurfaces::new().create(&spec).unwrap();
++        let lend = lend_to_devices(&surface).unwrap();
++        let (first, length, offset) = lend.host_import_pages().unwrap();
++        assert_eq!((length, offset), (page * 2, 0x40));
++        let hold = lend.hold();
++        let at = HostAddr::from_addr(first.as_ptr().addr());
++        drop((lend, surface));
++        assert!(mapped(at));
++        assert_eq!(read(at.addr().to_u64()), 0);
++        drop(hold);
++        assert!(!mapped(at));
++    }
++
+     /// A shared mapping of the whole dma-buf, `f` given its bytes, unmapped after.
+     fn through<T>(made: &LentDmaBuf, f: impl FnOnce(&mut [u8]) -> T) -> T {
+         let length = made.size.to_usize();
+@@ -329,9 +436,9 @@
+         let s = LinuxSurfaces::new().create(&over(&ranges, None)).unwrap();
+         let base = s.base_address().addr().to_u64();
+         let lend = lend_to_devices(&s).unwrap();
+-        assert_eq!(lend.first().as_ptr().addr().to_u64(), base);
++        assert_eq!(lend.first().unwrap().as_ptr().addr().to_u64(), base);
+         assert_eq!(lend.length(), 3 * page - 0x40);
+-        let (first, size, offset) = lend.pages();
++        let (first, size, offset) = lend.pages().unwrap();
+         let first = first.as_ptr().addr().to_u64();
+         assert_eq!((first, size, offset), (base - 0x40, 3 * page, 0x40));
+         assert_eq!(
+@@ -364,7 +471,7 @@
+         let (at, ranges) = scattered_pages(4);
+         let s = LinuxSurfaces::new().create(&over(&ranges, None)).unwrap();
+         let lend = lend_to_devices(&s).unwrap();
+-        let (first, ..) = lend.pages();
++        let (first, ..) = lend.pages().unwrap();
+         let first = first.as_ptr().addr().to_u64();
+         // From the lend's first byte, 0x40 into its first page: a range in its first page, one
+         // in its third, and one starting in that third page's last bytes and ending in the fourth.
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -155,14 +155,16 @@
+ struct Memory {
+     /// Its own memory.
+     own: Option<OwnMemory>,
+-    /// The view of the guest's pages it made, its first byte and length: its allocation's whole
+-    /// pages, then the zeros its buffers at its offset read past them ([`view`]).
++    /// An eager view, or a deferred view's inaccessible identity reservation: first byte and
++    /// length, including any zero tail. current_view() resolves the actual deferred mapping.
+     view: Option<(u64, u64)>,
+     /// Metadata only: weak catalogue entry, removed before the view is actually freed.
+     live_key: Option<LiveViewKey>,
+     /// An internal no-copy borrower can release at Metal's deallocator moment, before
+     /// the runtime frees its import. Such views unmap through the import-hold gate.
+     borrowed: AtomicBool,
++    /// Captured files plus an inaccessible identity reservation and optional realized view.
++    deferred: Option<super::vm::DeferredView>,
+ }
+ 
+ impl Drop for Memory {
+@@ -177,9 +179,23 @@
+                 views.remove(key);
+             }
+         }
++        // The unpublished identity reservation was never imported. A deferred view owns a
++        // separate realized mapping; release it through the same import-hold gate as eager
++        // aliases, then retire the cheap reservation separately. No physical pages are pinned.
++        if let Some(deferred) = &self.deferred
++            && let Some(first) = deferred.realized()
++        {
++            let length = self.view.expect("deferred views own a reservation").1;
++            let at = HostPtr::from_addr(first.to_usize());
++            if self.borrowed.load(Ordering::Acquire) {
++                let _ = crate::remap::VulkanVm::new().deallocate(at, length);
++            } else {
++                let _ = LinuxVm::new().deallocate(at, length);
++            }
++        }
+         if let Some((first, length)) = self.view {
+             let at = HostPtr::from_addr(first.to_usize());
+-            if self.borrowed.load(Ordering::Acquire) {
++            if self.deferred.is_none() && self.borrowed.load(Ordering::Acquire) {
+                 // A generic no-copy buffer's keep-alive holds an UnmapHold, not Memory.
+                 // Its deallocator can release the last Memory before the import is freed.
+                 let _ = crate::remap::VulkanVm::new().deallocate(at, length);
+@@ -274,7 +290,20 @@
+     }
+     let key = live_key(ranges, length, read_only)?;
+     let memory = live_views().lock().get(&key)?.upgrade()?;
+-    let (first, covered) = memory.view?;
++    // An exact pending plan owns its unexposed reservation and captured backing files. It
++    // can be shared without waiting; actual pointer consumers still prepare the same OnceLock.
++    // Ready views below require the full current-mapping proof as before.
++    if memory
++        .deferred
++        .as_ref()
++        .is_some_and(super::vm::DeferredView::is_pending)
++    {
++        return Some(memory);
++    }
++    if !memory.is_ready() {
++        return None;
++    }
++    let (first, covered) = memory.current_view()?;
+     if covered < length {
+         return None;
+     }
+@@ -298,7 +327,8 @@
+     read_only: bool,
+ ) -> Option<reims_vgpu_core::platform::os::vm::SharedHostMapping> {
+     let memory = matching_live_memory(ranges, length, read_only)?;
+-    let first = memory.view?.0;
++    memory.prepare().ok()?;
++    let first = memory.current_view()?.0;
+     memory.borrowed.store(true, Ordering::Release);
+     Some(reims_vgpu_core::platform::os::vm::SharedHostMapping {
+         address: HostPtr::from_addr(first.to_usize()),
+@@ -308,6 +338,77 @@
+ }
+ 
+ impl Memory {
++    /// Keep the file sequence and reserved virtual address without eagerly mapping every
++    /// scattered page. The new IOSurface still has its own identity, attachments and lifetime.
++    fn deferred(
++        runs: &[std::ops::Range<u64>],
++        length: u64,
++        tail: u64,
++        read_only: bool,
++    ) -> Option<Arc<Self>> {
++        let sources: Vec<_> = runs
++            .iter()
++            .map(|r| (HostPtr::from_addr(r.start.to_usize()), r.end - r.start))
++            .collect();
++        let key = (tail == 0)
++            .then(|| live_key(&sources, length, read_only))
++            .flatten();
++        let deferred = super::vm::DeferredView::new(runs, length, tail, read_only)?;
++        let first = deferred.first();
++        let memory = Arc::new(Self {
++            own: None,
++            view: Some((first, length + tail)),
++            live_key: key.clone(),
++            borrowed: AtomicBool::new(false),
++            deferred: Some(deferred),
++        });
++        if let Some(key) = key {
++            live_views().lock().insert(key, Arc::downgrade(&memory));
++        }
++        Some(memory)
++    }
++
++    fn prepare(&self) -> Result<(), KernReturn> {
++        self.deferred
++            .as_ref()
++            .map_or(Ok(()), super::vm::DeferredView::prepare)
++    }
++
++    /// Current bookkeeping range without forcing construction. Before materialization this
++    /// is the inaccessible reservation; after publication it is the one immutable actual view.
++    fn current_view(&self) -> Option<(u64, u64)> {
++        let (reserved, length) = self.view?;
++        let first = self
++            .deferred
++            .as_ref()
++            .and_then(super::vm::DeferredView::realized)
++            .unwrap_or(reserved);
++        Some((first, length))
++    }
++
++    /// Translate the object's reservation-relative base after realization, keeping its
++    /// original offset. No CPU pointer is ever published until prepare has succeeded.
++    fn current_address(&self, base: u64) -> u64 {
++        match (
++            self.view,
++            self.deferred
++                .as_ref()
++                .and_then(super::vm::DeferredView::realized),
++        ) {
++            (Some((reserved, length)), Some(actual)) => {
++                debug_assert!(base >= reserved && base - reserved < length);
++                actual + (base - reserved)
++            }
++            _ => base,
++        }
++    }
++
++    fn is_ready(&self) -> bool {
++        self.deferred
++            .as_ref()
++            .is_none_or(super::vm::DeferredView::is_ready)
++    }
++
+     /// Register a fully constructed view only. The catalogue never keeps it alive by itself.
+     fn live(
+         own: Option<OwnMemory>,
+@@ -331,6 +432,7 @@
+             view,
+             live_key: key.clone(),
+             borrowed: AtomicBool::new(false),
++            deferred: None,
+         });
+         if let Some(key) = key {
+             live_views().lock().insert(key, Arc::downgrade(&memory));
+@@ -415,6 +517,21 @@
+ unsafe impl Sync for MemoryHolder {}
+ 
+ impl MemoryHolder {
++    /// Whether these bytes are already one naturally contiguous owned or guest mapping.
++    /// An assembled view is a distinct extra mapping over scattered pages, even after some
++    /// explicit CPU user materialized it. Optional external-device import must not create or
++    /// pin that synthetic alias merely to avoid the already-available canonical row copy.
++    pub(super) fn has_native_host_view(&self) -> bool {
++        self.memory.view.is_none()
++    }
++
++    /// Resolve a lend's original reservation-relative address after preparing its memory.
++    /// The lend and its independently owned holds keep the published mapping alive.
++    pub(super) fn address(&self, base: u64) -> Result<u64, KernReturn> {
++        self.memory.prepare()?;
++        Ok(self.memory.current_address(base))
++    }
++
+     /// The holder of `surface`'s memory.
+     pub(crate) fn of(surface: &LinuxSurface) -> MemoryHolder {
+         let data = surface.data();
+@@ -551,7 +668,16 @@
+     }
+ 
+     fn base_address(&self) -> HostPtr {
+-        HostPtr::from_addr(self.data().base.to_usize())
++        if let Err(error) = self.data().memory.prepare() {
++            log::warn!("IOSurface contiguous mapping refused: {error:?}");
++            return HostPtr::NULL;
++        }
++        HostPtr::from_addr(
++            self.data()
++                .memory
++                .current_address(self.data().base)
++                .to_usize(),
++        )
+     }
+ 
+     fn alloc_size(&self) -> u64 {
+@@ -563,6 +689,18 @@
+             Arc::clone(&self.0.0),
+         )))))
+     }
++}
++
++/// The stable address used only for dependency tracking and canonical-page copies. Unlike
++/// Surface::base_address this never materializes a view; callers must NOT dereference it.
++pub(crate) fn reserved_base_address(surface: &LinuxSurface) -> u64 {
++    surface.data().base
++}
++
++/// The realized address when one exists, otherwise the inaccessible identity reservation.
++/// Dependency/write notifications query this without forcing a contiguous mapping.
++pub(crate) fn tracking_base_address(surface: &LinuxSurface) -> u64 {
++    surface.data().memory.current_address(surface.data().base)
+ }
+ 
+ /// Plane `plane` of `surface`: its offset from the base address and its bytes per row, as the
+@@ -814,7 +952,8 @@
+ /// guest's pages, or none.
+ pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
+     let memory = &surface.data().memory;
+-    let (first, length) = memory.view?;
++    memory.prepare().ok()?;
++    let (first, length) = memory.current_view()?;
+     let at = NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
+         first.to_usize(),
+     ))?;
+@@ -911,8 +1050,18 @@
+                             shared_memory = Some(memory);
+                             (at, None, None)
+                         } else {
+-                            let at = view(&made.pages, length, zeros, made.gpu_read_only)?;
+-                            (at, None, Some((at, length + zeros)))
++                            if let Some(memory) =
++                                Memory::deferred(&made.pages, length, zeros, made.gpu_read_only)
++                            {
++                                let at = memory.view?.0;
++                                shared_memory = Some(memory);
++                                (at, None, None)
++                            } else {
++                                // Unsupported deferred layouts retain the established eager
++                                // mapping path; no surface capability is removed by this change.
++                                let at = view(&made.pages, length, zeros, made.gpu_read_only)?;
++                                (at, None, Some((at, length + zeros)))
++                            }
+                         }
+                     }
+                 }
+@@ -986,6 +1135,7 @@
+                 view: None,
+                 live_key: None,
+                 borrowed: AtomicBool::new(false),
++                deferred: None,
+             }),
+             made: Mutex::new(MadeOver::default()),
+             attached: Attached::default(),
+@@ -1008,6 +1158,123 @@
+     use super::*;
+ 
+     const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
++
++    #[test]
++    fn deferred_device_lend_preserves_memory_without_guest_object_retain() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(4);
++        let surface = LinuxSurfaces::new()
++            .create(&live_spec(ranges.into_iter().rev().collect(), false))
++            .unwrap();
++        let (alias, length) = reserved_range(&surface).unwrap();
++        let lend = super::super::device_lend::lend_to_devices(&surface).unwrap();
++        let copied = lend.clone();
++        assert_eq!(surface.retain_count(), 1);
++        assert_eq!(lend.length(), page * 4);
++        assert!(super::super::files::pieces(alias, length).is_none());
++        drop(surface);
++        drop(lend);
++        let (pointer, bytes, offset) = copied.pages().unwrap();
++        assert_eq!((bytes, offset), (page * 4, 0));
++        let realized = pointer.as_ptr().addr().to_u64();
++        assert_ne!(realized, alias);
++        assert_eq!((read(realized), read(realized + page)), (3, 2));
++        drop(copied);
++        assert!(!mapped(HostPtr::from_addr(alias.to_usize())));
++        assert!(!mapped(HostPtr::from_addr(realized.to_usize())));
++        free(at, page * 4);
++    }
++
++    #[test]
++    fn deferred_shared_pointer_materializes_once_across_threads() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(4);
++        let surface = Arc::new(
++            LinuxSurfaces::new()
++                .create(&live_spec(ranges.into_iter().rev().collect(), false))
++                .unwrap(),
++        );
++        let (alias, length) = reserved_range(&surface).unwrap();
++        assert!(super::super::files::pieces(alias, length).is_none());
++        std::thread::scope(|scope| {
++            let a = scope.spawn(|| surface.base_address().addr().to_u64());
++            let b = scope.spawn(|| surface.base_address().addr().to_u64());
++            let first = a.join().unwrap();
++            assert_ne!(first, alias);
++            assert_eq!(b.join().unwrap(), first);
++        });
++        let actual = surface.base_address().addr().to_u64();
++        assert_eq!((read(actual), read(actual + page * 3)), (3, 0));
++        assert!(surface.data().memory.is_ready());
++        drop(surface);
++        free(at, page * 4);
++    }
++
++    #[test]
++    fn deferred_view_keeps_captured_files_when_source_address_is_replaced() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(3);
++        let (replacement, _) = guest_pages(3);
++        let surface = LinuxSurfaces::new()
++            .create(&live_spec(ranges.into_iter().rev().collect(), false))
++            .unwrap();
++        // A host remap changes the original address, never the backing-file snapshot the
++        // surface already owns. This is the same old-file lifetime as an eager shared alias.
++        LinuxVm::new()
++            .remap_shared_overwrite(
++                HostPtr::from_addr(at.to_usize()),
++                HostPtr::from_addr((replacement + page).to_usize()),
++                page,
++            )
++            .unwrap();
++        let base = surface.base_address().addr().to_u64();
++        assert_eq!(read(at), 1);
++        assert_eq!(read(base + page * 2), 0);
++        drop(surface);
++        free(at, page * 3);
++        free(replacement, page * 3);
++    }
++
++    /// Creation and a canonical row write must not construct a contiguous alias as a side
++    /// effect. This test also runs against the old implementation and fails there only on
++    /// those eager-mapping assertions, after checking the written pixels and cleaning up.
++    #[test]
++    fn deferred_surface_creation_and_canonical_copy_do_not_map_alias_pages() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(4);
++        let surface = LinuxSurfaces::new()
++            .create(&live_spec(ranges.into_iter().rev().collect(), false))
++            .unwrap();
++        let (alias, length) = reserved_range(&surface).unwrap();
++        let cold_create = super::super::files::pieces(alias, length).is_none();
++        let data = vec![0x97; page.to_usize() + 29];
++        crate::os::copy_surface_regions(
++            &surface,
++            (page * 4).to_usize(),
++            &[(page.to_usize() - 11, &data)],
++        )
++        .unwrap();
++        let cold_copy = super::super::files::pieces(alias, length).is_none();
++        assert_eq!(read(at + 3 * page + page - 11), 0x97);
++        assert_eq!(read(at + 2 * page), 0x97);
++        assert_eq!(read(at + page + 17), 0x97);
++        let ready = surface.base_address();
++        let actual = ready.addr().to_u64();
++        assert_ne!(actual, alias);
++        assert_eq!(read(actual + page - 11), 0x97);
++        assert_eq!(read(actual + 2 * page + 17), 0x97);
++        assert_eq!(tracking_base_address(&surface), actual);
++        drop(surface);
++        free(at, page * 4);
++        assert!(
++            cold_create,
++            "IOSurface construction must not eagerly install scattered aliases"
++        );
++        assert!(
++            cold_copy,
++            "canonical row copying must not materialize a contiguous alias"
++        );
++    }
+ 
+     fn canonical_alias_ptes(first: u64, length: u64) -> Vec<bool> {
+         use std::os::unix::fs::FileExt;
+@@ -1204,7 +1471,12 @@
+             let length = data.alloc_size.next_multiple_of(page_size());
+             (own.first(), length)
+         });
+-        own.or(data.memory.view)
++        data.memory.prepare().ok()?;
++        own.or(data.memory.current_view())
++    }
++
++    fn reserved_range(s: &LinuxSurface) -> Option<(u64, u64)> {
++        s.data().memory.view
+     }
+ 
+     fn free(at: u64, length: u64) {
+@@ -2164,6 +2436,9 @@
+             };
+             let s = LinuxSurfaces::new().create(&spec).unwrap();
+             let (view, length) = mapped_range(&s).unwrap();
++            // Inspect the realized contiguous view, not its creation-time reservation.
++            // The production pointer API is the operation that requests materialization.
++            assert_eq!(s.base_address().addr().to_u64(), view);
+             assert_eq!(super::super::files::runs_between(view, view + length), runs);
+             assert_eq!(read(view + page), second);
+             drop(s);
+--- a/reims/crates/reims-vgpu-vulkan/src/gpu/device.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/gpu/device.rs
+@@ -919,6 +919,49 @@
+         }))
+     }
+ 
++    fn supports_internal_backing_upload(&self) -> bool {
++        // This is a host-memory implementation capability, never a device/driver performance
++        // gate. Other platforms retain their existing resource/alias implementation.
++        cfg!(target_os = "linux")
++    }
++
++    fn new_internal_backing_upload(
++        &self,
++        length: u64,
++        fill: &mut dyn FnMut(&mut [u8]) -> RaiseResult<()>,
++    ) -> RaiseResult<Option<VulkanBuffer>> {
++        if !self.supports_internal_backing_upload() {
++            return Ok(None);
++        }
++        let Ok(size) = usize::try_from(length) else {
++            return Ok(None);
++        };
++        if size == 0 {
++            return Ok(None);
++        }
++        let made = create(
++            "internal backing upload",
++            Policy::Dies,
++            Nil::BufferLength,
++            || self.raw.new_buffer(length, rt::ResourceOptions::default()),
++        )?;
++        let Some(raw) = made else {
++            return Ok(None);
++        };
++        let Some(first) = raw.contents() else {
++            return Ok(None);
++        };
++        // SAFETY: this fresh Shared allocation is owned by raw, has exactly `length` bytes,
++        // and has never been published to an encoder, another thread or the guest. fill is
++        // synchronous and cannot retain the mutable slice. Afterward encoded copy commands
++        // retain raw until GPU completion, so later guest writes cannot alter this snapshot.
++        let bytes = unsafe { std::slice::from_raw_parts_mut(first.as_ptr(), size) };
++        fill(bytes)?;
++        // Internal staging is deliberately outside guest Metal-space placement/numbering.
++        // It cannot be fetched by a guest resource ID and is never a reverse-copy target.
++        Ok(Some(self.buffer(raw, None)))
++    }
++
+     /// Nil for a length of 0 or past the device's largest buffer, and for memory the device
+     /// cannot allocate, as Metal answers. At the address Metal's space gives it
+     /// ([`metal_space`]), so made through the runtime's descriptor, which takes an address.
+@@ -1886,6 +1929,76 @@
+             raw,
+             caps: OnceLock::new(),
+         })
++    }
++
++    /// CPU source lifetime and later mutation must not leak into a queued internal upload.
++    /// The encoder, not the caller's handle, owns its bytes until actual GPU completion.
++    #[test]
++    #[ignore = "requires an actual Vulkan device"]
++    fn internal_backing_upload_is_immutable_and_retained_until_gpu_copy() {
++        let d = dev();
++        let length = 8192usize;
++        let mut source: Vec<u8> = (0..length)
++            .map(|i| (i.wrapping_mul(37) ^ (i >> 3)) as u8)
++            .collect();
++        let expected = source.clone();
++        let mut calls = 0;
++        let first = d
++            .new_internal_backing_upload(length as u64, &mut |bytes| {
++                calls += 1;
++                bytes.copy_from_slice(&source);
++                Ok(())
++            })
++            .unwrap()
++            .unwrap();
++        assert_eq!(calls, 1);
++        source.fill(0xd3);
++        let second = d
++            .new_internal_backing_upload(length as u64, &mut |bytes| {
++                bytes.copy_from_slice(&source);
++                Ok(())
++            })
++            .unwrap()
++            .unwrap();
++        drop(source);
++        let out = d
++            .raw
++            .new_buffer((length * 2) as u64, rt::ResourceOptions::default())
++            .unwrap();
++        let queue = d.raw.new_command_queue().unwrap();
++        let cb = queue.command_buffer().unwrap();
++        let mut blit = cb.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&first.raw, 0, &out, 0, length as u64)
++            .unwrap();
++        blit.copy_from_buffer_to_buffer(&second.raw, 0, &out, length as u64, length as u64)
++            .unwrap();
++        blit.end_encoding().unwrap();
++        drop(first);
++        drop(second);
++        cb.commit().unwrap();
++        cb.wait_until_completed().unwrap();
++        // SAFETY: the shared destination is alive, its complete GPU writes have finished,
++        // and this test is the only reader/writer of these bytes.
++        let bytes =
++            unsafe { std::slice::from_raw_parts(out.contents().unwrap().as_ptr(), length * 2) };
++        assert_eq!(&bytes[..length], expected.as_slice());
++        assert!(bytes[length..].iter().all(|byte| *byte == 0xd3));
++    }
++
++    #[test]
++    #[ignore = "requires an actual Vulkan device"]
++    fn internal_backing_upload_empty_refusal_does_not_call_the_source() {
++        let d = dev();
++        let mut called = false;
++        assert!(
++            d.new_internal_backing_upload(0, &mut |_| {
++                called = true;
++                Ok(())
++            })
++            .unwrap()
++            .is_none()
++        );
++        assert!(!called);
+     }
+ 
+     /// A sparse heap takes its range where the model of Metal's space places it: unpinned or at a
+--- a/zero_copy.rs
++++ b/zero_copy.rs
+@@ -101,9 +101,24 @@
+                 .loader
+                 .as_ref()
+                 .ok_or("the optional import worker did not start")?;
+-            let view = Registration::prepare_view(memory)?;
++            let request = memory
++                .host_view_request()
++                .map_err(|error| format!("no request for the buffer's view: {error}"))?;
++            let length = memory.length();
+             let gpu = Arc::clone(gpu);
+-            *pending = Some(loader.start(move || Registration::from_view(&gpu, view))?);
++            *pending = Some(loader.start(move || {
++                // A scattered Linux IOSurface may not have a contiguous alias yet. Build it
++                // here on the already-bounded import worker, not while delivering a frame.
++                let view = request().map_err(|error| format!("no view of the buffer: {error}"))?;
++                if !view
++                    .offset
++                    .checked_add(length)
++                    .is_some_and(|end| end <= view.size)
++                {
++                    return Err("the host's view is shorter than the buffer".to_owned());
++                }
++                Registration::from_view(&gpu, view)
++            })?);
+         }
+         pending.as_ref().expect("queued above").poll()
+     }
+--- a/reims/crates/reims-vgpu-core/src/guest/ptr.rs
++++ b/reims/crates/reims-vgpu-core/src/guest/ptr.rs
+@@ -2,8 +2,9 @@
+ //! else in core's product code.
+ //!
+ //! The guest writes its memory concurrently, so there is never a Rust reference into it: every
+-//! access is one volatile or atomic load or store, of the width it names, at the moment the
+-//! operation reaches it. What the guest sees of each access:
++//! protocol-field access is one volatile or atomic load or store, of the width it names, at the moment the
++//! operation reaches it. Internal ordinary-RAM pixel snapshots use the separately documented
++//! copy_upload_to operation; they never replace protocol-field access. What the guest sees of each field access:
+ //!
+ //! - **One instruction per access.** A plain load or store is one `ldr`/`str` of its width,
+ //!   aligned or not: an unaligned one is the same single instruction (single-copy atomic under
+@@ -311,6 +312,28 @@
+                 rest = tail;
+                 i = i.wrapping_add(1);
+             }
++        }
++    }
++
++    /// Bulk bytes for an internal ordinary-RAM pixel upload, not a guest protocol field.
++    /// The caller has already validated a whole mapped RAM range and a disjoint, fresh
++    /// destination, retaining the device/task/map for this call. No source reference is made.
++    /// This is intentionally separate from copy_to: structured fields retain their existing
++    /// ordered volatile instruction/fault semantics. Pixel snapshots are not atomic; the
++    /// backing's external-write generation surrounds the copy and preserves racing writes.
++    #[allow(unsafe_code)] // architecture 17.3: raw guest access stays solely in guest/ptr.rs
++    pub(crate) fn copy_upload_to(self, dst: &mut [u8], death: impl Into<DeathId>) {
++        if dst.is_empty() {
++            return;
++        }
++        let source = check(self.addr, 0, dst.len(), death);
++        // SAFETY: the caller's whole-range map lookup proves readable ordinary guest RAM,
++        // retained for this synchronous operation. check rejects zero/overflow addresses.
++        // The destination is a fresh live upload allocation, checked disjoint by read_upload;
++        // its mutable slice covers exactly the copied length. The raw source is never
++        // represented as an immutable Rust reference. No stored guest pointer is followed.
++        unsafe {
++            std::ptr::copy_nonoverlapping(source.as_ptr::<u8>(), dst.as_mut_ptr(), dst.len());
+         }
+     }
+ 

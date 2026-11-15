@@ -1,0 +1,95 @@
+{
+  "description": "File hash contract for a mixed, recorded REIMS laboratory baseline. Not a revision of public upstream master.",
+  "upstream_reference_head_at_research_time": "1fe0acb68b287db36f1e6c7b9f45383940b8a76f",
+  "patch": "patches/complete-loop-fix.patch",
+  "patch_input_layout": "bundle root with reims/crates/... and zero_copy.rs, not the upstream repo root",
+  "all_before_files_from_one_git_commit": false,
+  "patch_sha256": "e7ae43375c23119957c88de6f84138037f193f6312676ea66dfc61d3b1983695",
+  "files": [
+    {
+      "path": "reims/crates/reims-vgpu/src/platform/vulkan/lent_memory.rs",
+      "before_sha256": "f81a99a79d79bb4b0c0d86b4cbfa5909d52f607b5936b8031cb75c30590cbfa0",
+      "after_sha256": "694405c8f96067b5bed33695a66f444a29ddeedee7afc5587ca93685a93ebbd5"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/tasks/local.rs",
+      "before_sha256": "d1a417329433c0ec55821165943ee73f5a8520ed2faa9099f94aa384dea10265",
+      "after_sha256": "6c17eac907e8177ee78194549aab0cb615485dedfdfb6dec6e7f04d6b3290a9c"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/tasks/local/memory.rs",
+      "before_sha256": "89d4a7b4e0e755f3e822274185edd69100eb71614ddf88ecf39479348685f923",
+      "after_sha256": "92829a6d5cae93dceefdefefda7ee25023a92877951cd18a71fc538f546d5467"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/memory/map.rs",
+      "before_sha256": "fb9ff264f99555656e8366cc0f736d46f805b362d074785b4af03e7885288291",
+      "after_sha256": "56a2b8461371d8025bc30a482cb6abcc09d546f10a358a750b420bcf092352d3"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/resources/host.rs",
+      "before_sha256": "269bb5cdf90791d4347c777b6ab33faa0653ecefeb093f817b1521d134da098e",
+      "after_sha256": "2bd8867ca30963183fd61f5587af8593742fd7dd58bb0c0685f417245911f889"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/resources/texture/backing.rs",
+      "before_sha256": "0ce70e9b6467ccf874102491db455c813253e909aa02709ceaad921c02eef3bd",
+      "after_sha256": "fdc764ac6f3438785fd1827f7d29e979afd08b2375b33bd75ceac31e29bb6633"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/platform/device.rs",
+      "before_sha256": "bb34410640655fa4873c07ff016f64ac83f41968919910822a82ebc60132b231",
+      "after_sha256": "0862e06d37b28bca7a0733a76dde74a6a947200acd092ed8140302b378dd605e"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/testkit/resource_host.rs",
+      "before_sha256": "527a61459e0145cdc670f42dd5d96bc8c964f917ac6b19c2d05e2743393c7365",
+      "after_sha256": "e5fd3fdfa1d678a8f606ec18a370ca76673879ec16342015784b0324cf64b9ab"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-video-core/src/device_memory.rs",
+      "before_sha256": "56f66ad27a330aa97ad71ba75262252dab0a14a01ca8cfd12512fd4ac71370ba",
+      "after_sha256": "e5f14b0c5b4b7a8105aaa7b1645130f4e31708b55653670b6db426d7a367fc4c"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux.rs",
+      "before_sha256": "1268f12d1a56ee23cd386c4ea8dbb3d1ad8cdc57ae1cd64a3440ce27d6601b1e",
+      "after_sha256": "61e6c4aedca6eacda5b2cb0e2c6f03f8608e1389bd63b67572db9a2afa227c20"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/surface.rs",
+      "before_sha256": "4ccd716a10389c1cfdbcf1f7c52b13efc1439a17fd8541c5e0db16a5bd086e3b",
+      "after_sha256": "41a66d1b6ca1c26a7c44fff3dc2a3a53837ab049d5a573e6855c464da0af763c"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux/vm.rs",
+      "before_sha256": "32ea7a923a3d51c4d6d16d2e5e3bd8d8327825f211d99f9157cc3a1a4681a2be",
+      "after_sha256": "68ea186161a511c49fcad071b47044ad5fe81914d29e604c6af36244260ad8ce"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs",
+      "before_sha256": "f61e1469cae59d1fdbcc91e898bae432a642b957559994a92e5c4f3997cfb7bd",
+      "after_sha256": "e007238f7732d3b876115877568706f9c47db8ace5017152f21da69efc96e9aa"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs",
+      "before_sha256": "274d91b5647e07f553b9a40e0c43a74447ace45163269262b244a10555d360c9",
+      "after_sha256": "5b15b965179d052fc66a35040cac9afa04740878c60f14fd17e06c7344a0f444"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/gpu/device.rs",
+      "before_sha256": "c95d24aadcc25a9cbb7a9d25ded29597ddb111538d3a7d1b88bfafbda471423f",
+      "after_sha256": "2ce0915613bab8a6a20ac5a22e6b4e50b93f30a2f9594fd44f510c4f783e8f45"
+    },
+    {
+      "path": "zero_copy.rs",
+      "before_sha256": "6e00366049e27fb8ae9be07d888ff3b297ba34e36728d59e235d0480c6841c68",
+      "after_sha256": "14e32fbd9cc3540626c0acd744f6f6b80ee2f8296e6314ad4fd8eccaa06428ab"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/guest/ptr.rs",
+      "before_sha256": "5bd1b96cdcecc4b0a9167f305fe27be373d30bb257dbdf3234476d5d682f1c69",
+      "after_sha256": "2982761d8215d7fe10b5f79579764f2cf9dc37ff33595b0e9e7fd2a88d995d45"
+    }
+  ]
+}

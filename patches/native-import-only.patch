@@ -1,0 +1,172 @@
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -517,6 +517,14 @@
+ unsafe impl Sync for MemoryHolder {}
+ 
+ impl MemoryHolder {
++    /// Whether these bytes are already one naturally contiguous owned or guest mapping.
++    /// An assembled view is a distinct extra mapping over scattered pages, even after some
++    /// explicit CPU user materialized it. Optional external-device import must not create or
++    /// pin that synthetic alias merely to avoid the already-available canonical row copy.
++    pub(super) fn has_native_host_view(&self) -> bool {
++        self.memory.view.is_none()
++    }
++
+     /// Resolve a lend's original reservation-relative address after preparing its memory.
+     /// The lend and its independently owned holds keep the published mapping alive.
+     pub(super) fn address(&self, base: u64) -> Result<u64, KernReturn> {
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs
+@@ -144,6 +144,22 @@
+         // SAFETY: first and the page-aligned start belong to the prepared, held mapping.
+         let at = unsafe { NonNull::new_unchecked(first.as_ptr().sub(offset.to_usize())) };
+         Ok((at, end - start, offset))
++    }
++
++    /// Existing contiguous host pages suitable for an optional external-device import.
++    /// Scattered guest pages have a canonical row-copy path already. Manufacturing a second
++    /// contiguous alias and registering every page is extra work, not zero-copy ownership of
++    /// the existing host mapping; it also pins those alias pages for the registration's life.
++    /// Decline it structurally, without mapping anything or consulting a GPU/driver ID.
++    ///
++    /// Explicit CPU pointer consumers retain pages(), and a device that accepts scatter/gather
++    /// keeps dma_buf_of(). Naturally contiguous guest memory and host-owned allocations still
++    /// support direct host registration with exactly their old lifetime and offset semantics.
++    pub fn host_import_pages(&self) -> Result<(NonNull<u8>, u64, u64), &'static str> {
++        if !self.holder.has_native_host_view() {
++            return Err("scattered guest pages need a synthetic alias; use the canonical row copy");
++        }
++        self.pages()
+     }
+ 
+     /// A dma-buf of `ranges` of the lent bytes, each an offset from [`Self::first`] and a length,
+@@ -303,6 +319,92 @@
+         assert!(vm.deallocate(at, length).is_success());
+     }
+ 
++    #[test]
++    fn optional_host_import_does_not_construct_a_scattered_alias() {
++        let page = vm::page_size();
++        let (at, ranges) = scattered_pages(3);
++        let surface = LinuxSurfaces::new().create(&over(&ranges, None)).unwrap();
++        let reserved = super::super::surface::reserved_base_address(&surface) - 0x40;
++        let lend = lend_to_devices(&surface).unwrap();
++        for _ in 0..32 {
++            assert!(lend.host_import_pages().is_err());
++        }
++        assert!(super::super::files::pieces(reserved, page * 3).is_none());
++        assert_eq!(surface.retain_count(), 1);
++        // A caller that explicitly needs CPU-contiguous bytes still gets the exact view.
++        let (first, length, offset) = lend.pages().unwrap();
++        assert_eq!((length, offset), (page * 3, 0x40));
++        let address = first.as_ptr().addr().to_u64();
++        assert_eq!(
++            [
++                read(address),
++                read(address + page),
++                read(address + page * 2)
++            ],
++            [2, 1, 0]
++        );
++        // Cache/readiness must not make import policy depend on unrelated request ordering.
++        assert!(lend.host_import_pages().is_err());
++        drop((lend, surface));
++        free(at, page * 3);
++    }
++
++    #[test]
++    fn optional_host_import_preserves_native_contiguous_guest_pages_and_offset() {
++        let page = vm::page_size();
++        let (at, _) = scattered_pages(3);
++        // A single existing guest mapping, not a new assembled surface view described
++        // by three separate client ranges. The latter must use the tested copy fallback.
++        let ranges = [PhysicalMemoryRange {
++            physical_address: at,
++            physical_length: page * 3,
++        }];
++        let spec = SurfaceSpec {
++            alloc_size: page * 3,
++            ..over(&ranges, None)
++        };
++        let surface = LinuxSurfaces::new().create(&spec).unwrap();
++        let lend = lend_to_devices(&surface).unwrap();
++        let (first, length, offset) = lend.host_import_pages().unwrap();
++        assert_eq!(
++            (first.as_ptr().addr().to_u64(), length, offset),
++            (at, page * 3, 0x40)
++        );
++        let hold = lend.hold();
++        drop((lend, surface));
++        assert_eq!([read(at), read(at + page), read(at + 2 * page)], [0, 1, 2]);
++        drop(hold);
++        free(at, page * 3);
++    }
++
++    #[test]
++    fn optional_host_import_keeps_host_owned_allocation_alive() {
++        let page = vm::page_size();
++        let spec = SurfaceSpec {
++            pixel_format: BGRA,
++            alloc_size: page * 2,
++            offset: 0x40,
++            width: 16,
++            height: 16,
++            bytes_per_element: 4,
++            bytes_per_row: 64,
++            element_width: 1,
++            element_height: 1,
++            ..SurfaceSpec::default()
++        };
++        let surface = LinuxSurfaces::new().create(&spec).unwrap();
++        let lend = lend_to_devices(&surface).unwrap();
++        let (first, length, offset) = lend.host_import_pages().unwrap();
++        assert_eq!((length, offset), (page * 2, 0x40));
++        let hold = lend.hold();
++        let at = HostAddr::from_addr(first.as_ptr().addr());
++        drop((lend, surface));
++        assert!(mapped(at));
++        assert_eq!(read(at.addr().to_u64()), 0);
++        drop(hold);
++        assert!(!mapped(at));
++    }
++
+     /// A shared mapping of the whole dma-buf, `f` given its bytes, unmapped after.
+     fn through<T>(made: &LentDmaBuf, f: impl FnOnce(&mut [u8]) -> T) -> T {
+         let length = made.size.to_usize();
+--- a/reims/crates/reims-vgpu/src/platform/vulkan/lent_memory.rs
++++ b/reims/crates/reims-vgpu/src/platform/vulkan/lent_memory.rs
+@@ -65,28 +65,17 @@
+     }
+ 
+     fn host_view_request(&self) -> Result<HostViewRequest, SurfaceError> {
+-        // DeviceLend holds only the mapping memory, never a guest-visible IOSurface retain.
+-        // No per-page mapping or driver work is done on this calling (decode) thread.
+-        let lend = self.lend.clone();
+-        Ok(Box::new(move || {
+-            let (first, size, offset) = lend
+-                .pages()
+-                .map_err(|why| SurfaceError::Unreachable(why.to_owned()))?;
+-            let too_large =
+-                || SurfaceError::Unreachable("a view past the address space".to_owned());
+-            Ok(HostView {
+-                first,
+-                size: usize::try_from(size).map_err(|_| too_large())?,
+-                offset: usize::try_from(offset).map_err(|_| too_large())?,
+-                hold: lend.hold(),
+-            })
+-        }))
++        // Import is optional: only lend naturally contiguous memory. Do not enqueue synthetic
++        // alias construction for scattered guest pixels whose canonical row-copy path is ready.
++        // The returned hold owns only mapping memory, never a guest-visible IOSurface retain.
++        let view = self.host_view()?;
++        Ok(Box::new(move || Ok(view)))
+     }
+ 
+     fn host_view(&self) -> Result<HostView, SurfaceError> {
+         let (first, size, offset) = self
+             .lend
+-            .pages()
++            .host_import_pages()
+             .map_err(|why| SurfaceError::Unreachable(why.to_owned()))?;
+         let too_large = || SurfaceError::Unreachable("a view past the address space".to_owned());
+         Ok(HostView {
