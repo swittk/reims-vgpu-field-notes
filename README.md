@@ -22,6 +22,8 @@ On one anonymized Linux x86-64 NVIDIA host, the final 260-second original screen
 - [Final normalized results](results/loop-control.json) and [negative-control results](results/rejected-candidates.json).
 - [Potential upstream discussion and already-open related work](UPSTREAM.md).
 
+A separate Spotlight ghost-text render-pass issue is tracked at [Metal2Vulkan #17](https://github.com/steelbrain/metal2vulkan/issues/17); this is **not** the VideoToolbox loop defect.
+
 The Metal2Vulkan-specific investigation is published separately in [metal2vulkan-field-notes](https://github.com/swittk/metal2vulkan-field-notes).
 
 ## Important patch limitation
