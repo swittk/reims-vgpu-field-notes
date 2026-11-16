@@ -1,0 +1,31 @@
+{
+  "scope": "historical single-version Sequoia 15.8.1(x86-64) Metal compatibility experiment, no current upstream integration",
+  "original_source_sha256": {
+    "ReimsSequoiaMetal.cpp": "a77d60999d24d7815c092ecbe58e5bde18d0d29b613306319eec7cd3c5f91801",
+    "UserPatch.cpp": "afd7a4ee5e32e90eb52802e7c0771d6cb2b69f5f4ab642b3aa20bb3baa712e99",
+    "UserPatch.hpp": "d60b1464920b628f5033a9ddd50de385e3d5e2ccdcb83db114ed621944e94402"
+  },
+  "published_source_sha256": {
+    "ReimsSequoiaMetal.cpp": "67849da448927c63688275351e501207868b470e098741a3ed1a23409de5d4ab",
+    "UserPatch.cpp": "afd7a4ee5e32e90eb52802e7c0771d6cb2b69f5f4ab642b3aa20bb3baa712e99",
+    "UserPatch.hpp": "d60b1464920b628f5033a9ddd50de385e3d5e2ccdcb83db114ed621944e94402"
+  },
+  "sanitization": "only the original private bundle identifier in ReimsSequoiaMetal.cpp and the two Info.plist identifiers were changed; UserPatch.cpp/.hpp are original bytes",
+  "original_tested_kext_sha256": "37aece16b8d290583884e7237ba49e2ccb351572490bd5cfa929276ec7fbcccd",
+  "original_tested_executable_bytes": 36248,
+  "original_build_tested_2026_10_28": true,
+  "sanitized_package_guest_tested": false,
+  "full_Metal_compatibility_certified": false,
+  "ReimsUtil": {
+    "commit": "381f913",
+    "licenses": "GPL-2.0-or-later OR LGPL-3.0-or-later",
+    "Lilu_plugin_components_license": "BSD-3-Clause"
+  },
+  "external_deps": {
+    "Lilu": "1.7.1",
+    "MacKernelSDK": "3f750085caa17ec3a7880f11c11bf4f48cd6a164",
+    "cctools-port": "df82634ce7c3eddba9722e881433fbe357396e16"
+  },
+  "compiled_public_source_objects": true,
+  "public_source_compilation_note": "All three sanitized C++ objects compiled using pinned Lilu 1.7.1 and MacKernelSDK headers, Clang 19 in offline isolated container. A fully installable kext was not relinked or guest-tested."
+}

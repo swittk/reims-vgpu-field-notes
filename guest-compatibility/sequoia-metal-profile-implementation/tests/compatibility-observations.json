@@ -1,0 +1,19 @@
+{
+  "guest": "macOS Sequoia 15.8.1 (24H32), x86_64",
+  "host": "single anonymized Linux Vulkan/NVIDIA host",
+  "problem": "stock Safari 18.6 WebGL1/2 failed before profile correction despite native Metal being present",
+  "change": "narrowly guarded AppleParavirtGPUMetal profile-function constant 10000 -> 10001 in memory",
+  "native_metal_replay_tests_passed": 24,
+  "safari_webgl1_and_2_after": "both render verified exact RGBA [64,128,191,255]",
+  "safari_resource_smoke": {
+    "texture_sizes": "16..2048 with mipmaps, cube/array",
+    "texture_lifetime_cycles": 150,
+    "context_lifetime_cycles": 15,
+    "instanced_draw_seconds": 90
+  },
+  "safari_1000fish_fps": 15.03,
+  "chromium_1000fish_fps": 34.75,
+  "warning": "browser runs not a randomized matched comparison; full Metal-family conformance not established",
+  "published_source_compiles": true,
+  "renamed_bundle_guest_tested": false
+}

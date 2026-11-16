@@ -1,8 +1,10 @@
 # Existing upstream discussions and possible future contributions
 
-No additional upstream issue, PR, or comment has been submitted while publishing the larger archive.
+The FIFO guest-driver lost-wakeup issue has now been filed as [REIMS #158](https://github.com/steelbrain/reims-vgpu/issues/158). A separate display-timing issue and Safari/Metal-profile compatibility issue remain only proposals; neither has been filed.
 
 ## Published issues
+
+- **[REIMS #158](https://github.com/steelbrain/reims-vgpu/issues/158)** — guest FIFO producer publication memory-ordering race, with captured pending commands and a [reviewable Lilu helper](guest-compatibility/fifo-publication-implementation/README.md).
 
 - **[REIMS #157](https://github.com/steelbrain/reims-vgpu/issues/157)** — synthetic scattered guest-page host registration and HEVC loop pacing. The full local source evidence remains on its recorded mixed baseline.
 - **[Metal2Vulkan #17](https://github.com/steelbrain/metal2vulkan/issues/17)** — Clear-loaded color attachment self-read and stale glyph/caret pixels, with a bounded diagnostic implementation.
@@ -23,3 +25,5 @@ No additional upstream issue, PR, or comment has been submitted while publishing
 [Metal2Vulkan #11](https://github.com/steelbrain/metal2vulkan/issues/11) examines shadowing on RADV. Our NVIDIA [selective-byte-store rejection](https://github.com/swittk/metal2vulkan-field-notes/blob/main/diary/selective-byte-store-regression.md) is independent negative evidence, not an explanation of that report.
 
 The archive prioritizes measured causes and source provenance. Current-upstream correctness/performance validation would be needed before opening new PRs. No maintainer acceptance is presumed.
+
+- [Sequoia Safari WebGL / Metal-profile correction](guest-compatibility/sequoia-metal-profile-implementation/README.md): exact-version guest compatibility helper is archived with source, measurements and licensing. Not a ready-to-merge general feature-profile change. Check any newer guest driver before filing.

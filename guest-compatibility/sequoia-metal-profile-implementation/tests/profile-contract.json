@@ -1,0 +1,13 @@
+{
+  "darwin": 24,
+  "uuid": "6c8e6565bd843b439314b20aebe59a28",
+  "fatSHA256": "20ad5784479ebd1665739c73a2eaa2cb87178082db68dfb50b452f903276c9fd",
+  "fileBytes": 744032,
+  "expectedUUIDOffset": 18688,
+  "expectedPatternOffset": 57685,
+  "find": "554889e5b8102700005dc3",
+  "replace": "554889e5b8112700005dc3",
+  "keepsFIFOHelperUnchanged": true,
+  "changesWireVersion": false,
+  "changesTextureBounds": false
+}
