@@ -1,5 +1,7 @@
 # x86-64 Sequoia guest FIFO lost notification
 
+**Reviewable implementation now available:** [ReimsFifoOrder v0.1.3 Lilu helper source, original patch bytes, build requirements, static contract checks, native litmus and bounded store-buffer model](fifo-publication-implementation/README.md). The published code differs from the live-tested original only by replacement of the private bundle identifier; source object compilation passed, but the renamed plugin was not separately installed in a guest.
+
 **System:** x86-64 macOS Sequoia Apple paravirtual GPU task FIFO, a Linux REIMS host consumer. **Evidence:** exact guest memory state, finite independent concurrency tests and a carefully version-scoped guest workaround.
 
 An affected guest could stop delivering commands even though its FIFO still contained valid unread commands. Inspection found 416 unread bytes containing 16 correctly formed commands while the host FIFO worker slept on the empty-queue condition variable; no later wake notification appeared. This was not evidence of a stalled shader or absent GPU capability.

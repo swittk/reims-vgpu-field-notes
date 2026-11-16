@@ -1,0 +1,17 @@
+{
+  "scope": "Sanitized source-only reproduction of the locally deployed and live-verified v0.1.3 plugin, not a byte-identical re-release of the built kext",
+  "original_source_sha256": "1a662df4c179908754e72260d434acf38de71e7b2fef6401dd0b563f84bd233b",
+  "published_source_sha256": "1c287ad0731dc4cd36593cebbf1b1bec9794172c9b9b6a1e49b1165da1d64032",
+  "sanitization": "Only original private bundle identifier replaced with org.reims.fieldnotes.ReimsFifoOrder in C++ source and Info.plist. No executable code path changed.",
+  "tested_local_compiled_kext_sha256": "083b0f519bfe67b25d8c445aed53d86faac8f75e2cf1ef9176d3731ad3733ed5",
+  "historical_kext_version": "0.1.3",
+  "local_guest_validation": "macOS Sequoia 15.8.1 (24H32), Lilu 1.7.1, verified state 7 reported in guest IORegistry and loader diagnostic, followed by bounded graphics and idle/wake runs",
+  "mac_kernel_sdk_commit": "3f750085caa17ec3a7880f11c11bf4f48cd6a164",
+  "cctools_port_commit": "df82634ce7c3eddba9722e881433fbe357396e16",
+  "lilu_version": "1.7.1",
+  "built_with": "Clang19 and a cctools ld64 port with kernel-extension support",
+  "packaged_source_changed_from_live_kext": true,
+  "published_binary": false,
+  "apple_original_driver_bytes_or_kernel_collections_published": false,
+  "current_reims_master_build_validated": false
+}

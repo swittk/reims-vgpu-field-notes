@@ -10,7 +10,7 @@ It is an independent research archive, not an official REIMS release or a collec
 |---|---|
 | **The full engineering backlog, seven additional source patches, test scope and measured outcomes** | [Source and performance case index](archive/README.md) |
 | Platform behaviors demonstrated, and claims we cannot independently verify | [Capability and test matrix](CAPABILITIES.md) |
-| Guest FIFO wakeups, Sequoia Metal/Safari compatibility, display clocks, SMC and streaming | [Guest compatibility / operations](guest-compatibility/README.md) |
+| Guest FIFO wakeups, Sequoia Metal/Safari compatibility, display clocks, SMC and streaming | [Guest compatibility / operations](guest-compatibility/README.md), including the [tested FIFO guest-patch source](guest-compatibility/fifo-publication-implementation/README.md) |
 | How we measured, and why some plausible optimizations failed | [Research methodology and failed approaches](RESEARCH_METHOD.md) |
 | REIMS video-loop issue and final narrow memory-layout fix | [REIMS #157](https://github.com/steelbrain/reims-vgpu/issues/157) · [accepted implementation](diary/03-accepted-implementation.md) |
 | Metal2Vulkan shadowing, source patches, Spotlight corruption and negative GPU results | [Companion Metal2Vulkan archive](https://github.com/swittk/metal2vulkan-field-notes) |

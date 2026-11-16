@@ -1,0 +1,61 @@
+{
+  "experiment": "Native x86 host-side conditional-doorbell model (not a guest VM reproduction)",
+  "source_date_utc": "2026-10-27T14:43:07.390728+00:00",
+  "data_kind": "observed finite host runs",
+  "runs": [
+    {
+      "mode": "unfenced",
+      "loops": 5000000,
+      "lostWakeups": 93970,
+      "hostDoubleCheck": true,
+      "notified": 3401125,
+      "hostSawNewWritten": 3464515,
+      "seconds": 2.21
+    },
+    {
+      "mode": "guest-exchange",
+      "loops": 5000000,
+      "lostWakeups": 0,
+      "hostDoubleCheck": true,
+      "notified": 2118050,
+      "hostSawNewWritten": 4323096,
+      "seconds": 2.121
+    },
+    {
+      "mode": "guest-fence",
+      "loops": 5000000,
+      "lostWakeups": 0,
+      "hostDoubleCheck": true,
+      "notified": 3541407,
+      "hostSawNewWritten": 3123536,
+      "seconds": 2.337
+    },
+    {
+      "mode": "unfenced",
+      "loops": 5000000,
+      "lostWakeups": 137553,
+      "hostDoubleCheck": true,
+      "notified": 3361630,
+      "hostSawNewWritten": 4006859,
+      "seconds": 2.285
+    },
+    {
+      "mode": "guest-exchange",
+      "loops": 5000000,
+      "lostWakeups": 0,
+      "hostDoubleCheck": true,
+      "notified": 2297341,
+      "hostSawNewWritten": 4425447,
+      "seconds": 2.079
+    },
+    {
+      "mode": "guest-fence",
+      "loops": 5000000,
+      "lostWakeups": 0,
+      "hostDoubleCheck": true,
+      "notified": 4182418,
+      "hostSawNewWritten": 3848310,
+      "seconds": 2.265
+    }
+  ]
+}
