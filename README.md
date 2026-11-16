@@ -26,6 +26,10 @@ A separate Spotlight ghost-text render-pass issue is tracked at [Metal2Vulkan #1
 
 The Metal2Vulkan-specific investigation is published separately in [metal2vulkan-field-notes](https://github.com/swittk/metal2vulkan-field-notes).
 
+## Upstream issue
+
+The bounded VideoToolbox/scattered IOSurface finding is filed at [REIMS #157 — Synthetic host registration and video-loop stalls](https://github.com/steelbrain/reims-vgpu/issues/157). This is a research issue, not an upstream-ready pull request.
+
 ## Important patch limitation
 
 The final REIMS patch was built from source files coming from more than one recorded local baseline. **There is no single public upstream Git commit to which this 17-file patch can truthfully be said to apply.** A file-by-file SHA contract is provided so researchers can inspect or reconstruct the particular input and output. Upstream integration requires rebase, dependency reconciliation, and independent build/test on current master.

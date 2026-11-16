@@ -1,4 +1,4 @@
-# Suggested upstream discussion (not yet posted)
+# Upstream issue #157 (filed; no PR)
 
 Proposed title: **Linux/Vulkan VideoToolbox: synthetic scattered-page host registration can stall looping playback**
 
@@ -17,4 +17,4 @@ Do not open duplicate upstream issues for adjacent problems:
 - [REIMS #111: pinned resident growth](https://github.com/steelbrain/reims-vgpu/issues/111), a different lifetime symptom.
 - [metal2vulkan #11: RADV shadowing regression](https://github.com/steelbrain/metal2vulkan/issues/11), which was measured on a different platform.
 
-Contribute observations and source permalinks first. Never imply upstream acceptance, and don't publish proprietary source media or private machine data.
+The issue has been filed, but there is no upstream acceptance or merge. Do not publish proprietary source media or private machine data.
