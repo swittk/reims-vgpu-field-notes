@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "source": "locally tested historical source snapshot",
+  "patch_path": "source.patch",
+  "patch_sha256": "f107e653b417cd22cc1286645811e564a4e7a717123bad60eb34bed4187485f0",
+  "snapshot_before_after_from_exact_reverse_forward_replay": true,
+  "replay_scope": "only changed source files; not an independently built full project",
+  "applies_to_current_upstream_master": "not verified",
+  "files": [
+    {
+      "path": "reims/crates/reims-vgpu-core/src/lib.rs",
+      "before_sha256": "0a97cd6ea747e484947a6c6c4cb985c417beb2eb7c72181c539a1d653e7195bc",
+      "after_sha256": "9f6706dd81c33e66deac68a2f44dbc1529f80c9c422c08737604b4e9f2295408"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/resources/host.rs",
+      "before_sha256": "70ef6e2e6386321d72032d80c1a7e5c853bf7efa92232c760eaf0e19ee003d77",
+      "after_sha256": "038f34de81e5ded5b39d6c1fdf68ffb0e9516a43ec5f63feac135b4b174ee37a"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/tasks/local/memory.rs",
+      "before_sha256": "2cba9f7bd7a7f20a35728e1133948004846c3709ea1efb742186e6003c67ee3e",
+      "after_sha256": "032a287999b6337e6db5b9d213f0f0e81e12012b1bf6e632993382ca3befe648"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/tasks/local.rs",
+      "before_sha256": "7c3416e8a845cb010b5870f5d2d5e1cc8356370616861fda35ee201518ba20aa",
+      "after_sha256": "3ae5c6b84cbe60fb09af4181f0d8d1aba876ef8369936d00eb0be099eafbf3c6"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/resources/texture/backing.rs",
+      "before_sha256": "afb37ccd5899689a3a4f3e5bbac5f56bab4d2725f9cbc84560d9a26f7b53a076",
+      "after_sha256": "bbea5330d99a4a0fafd0617a60132fd0485cfda2394347c174415d7138197e12"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-core/src/iosurface/device.rs",
+      "before_sha256": "9cfb1b3f1537db46a8728838b7339770a69291b6cc991841c6bd5b89202d94f7",
+      "after_sha256": "4ea4fa5114340e0284d0d40d4776ec74501208a810bd818de9e4c95ab8d67fa4"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-video-core/src/surfaces.rs",
+      "before_sha256": "956db15ec420c990cfc75f252a22d507a39c1cd776115e944c3e73fe4d7dae72",
+      "after_sha256": "513480da7d00a4a29f8fc1567a1eabd5a96cca50577c244441b859ccfd8fd788"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-video-core/src/host/decoder.rs",
+      "before_sha256": "dc629d5e9ab8cf12f49eb2b339aab5fa41cb90ba2327f4862666aeb812bf3cfa",
+      "after_sha256": "2b093d6515f879d9d51962d1e486a9a5a07054c14e13410045c66303f206f0d4"
+    },
+    {
+      "path": "reims/crates/reims-vgpu/src/video.rs",
+      "before_sha256": "bd2aa411b3975157aeac6319fecf90543f5dcdb7ca0320f71e3f411d08e86e80",
+      "after_sha256": "fa511089e301436d650c7a1b1a65f492565d2f2fa526bccc820fab5013ca600e"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs",
+      "before_sha256": "c5cf3d3163c35c1e37fb8a5c235b8a5d36c99bbd5fca970914baffa6252012d0",
+      "after_sha256": "6306c840d9a136bef9c30b6776805ea8eb3511b9a12a46bb9d67779037448065"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os/linux.rs",
+      "before_sha256": "aba73bbcd6328e1a07061b66826b2cf0de1aded4ef59063de2bee57497d1e97b",
+      "after_sha256": "9806cec609ced031e7bd58d898647439672e2911a4a7973fac957684d58ddf6c"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/os.rs",
+      "before_sha256": "b8a95d3cc823161b0600b489ed18a5bf8d8990c08e184ace515a4d7a5dd750d9",
+      "after_sha256": "874ce550ab6991b0e2ae65ff7f3db82a1c043d35b672e50f2ce123bad15f6345"
+    },
+    {
+      "path": "reims/crates/reims-vgpu-vulkan/src/gpu/device.rs",
+      "before_sha256": "a429d79e1b3e07e54e4e7acdd9b948fe0db6b30e09773f6e911a2ee48969ca26",
+      "after_sha256": "c95d24aadcc25a9cbb7a9d25ded29597ddb111538d3a7d1b88bfafbda471423f"
+    },
+    {
+      "path": "metal2vulkan-runtime/src/shadow.rs",
+      "before_sha256": "b11f6dd956601da59ec0f263ad40c3d869166b55c3c8eaa15f7e53f838b02564",
+      "after_sha256": "67ed2b9b83b00307b013768a64cf2ee9d9a379eb0269b8da3ec40b3a5dc77520"
+    }
+  ]
+}

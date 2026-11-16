@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source": "locally tested historical source snapshot",
+  "patch_path": "source.patch",
+  "patch_sha256": "31e9b170aadfa7cc754381238e230cab8514fe1ca93c1bf78488311024f14804",
+  "snapshot_before_after_from_exact_reverse_forward_replay": true,
+  "replay_scope": "only changed source files; not an independently built full project",
+  "applies_to_current_upstream_master": "not verified",
+  "files": [
+    {
+      "path": "ui/vnc.c",
+      "before_sha256": "72c3eb6493b861f2317984c3790d506dae57d622c3c33e0bd02d009cb85bbcbf",
+      "after_sha256": "c4fca04efba72510d4bda376e7927db71becd57025271baf01c64bdd88a5e008"
+    }
+  ]
+}

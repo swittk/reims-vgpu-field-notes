@@ -1,0 +1,29 @@
+--- a/reims/crates/reims-vgpu-video-core/src/host/encoder.rs
++++ b/reims/crates/reims-vgpu-video-core/src/host/encoder.rs
+@@ -70,11 +70,12 @@
+ /// (26A434, 2026-10-24).
+ const FORCE_KEY_FRAME: &str = "EncoderForceKeyframe";
+ 
+-/// The alignments the host asks the guest's source buffers to have: Apple's
+-/// AVC encoder asks for 64 for both (measured on macOS 27, 26A434,
+-/// 2026-10-24: its `Epba`). Our encoders copy each frame, so they only make
+-/// rows start where a copy is quick.
+-const SOURCE_ALIGNMENT: i64 = 64;
++/// No extra source alignment is required: SourceCopy gathers byte-addressed
++/// planes and repacks their rows before a backend reads them. A backend never
++/// receives the guest's offsets or stride. Advertising Apple's hardware-specific
++/// 64-byte requirement forces unnecessary guest pixel transfers for otherwise
++/// valid IOSurface buffers (including the ordinary 32-byte plane offset).
++const SOURCE_ALIGNMENT: i64 = 1;
+ /// `kVTEncodeInfo_FrameDropped` (`VTErrors.h`): an `Eemt`'s info flag for a
+ /// frame the encoder dropped, which comes with no sample.
+ const INFO_FRAME_DROPPED: u32 = 1 << 1;
+@@ -536,7 +537,7 @@
+ 
+     /// `Epba`: the attributes the guest's source buffers are to have: the
+     /// formats the backend takes, the session's size, IOSurface backing and
+-    /// Apple's AVC encoder's alignments. A guest of protocol 3 or later
++    /// no extra alignment requirement. A guest of protocol 3 or later
+     /// answers it within 1.1 s; an older one is not waited for.
+     fn set_source_pixel_buffer_attributes(&self, width: u32, height: u32) -> OsStatus {
+         let formats = self

@@ -1,39 +1,41 @@
-# REIMS vGPU: video handoff and guest-memory field notes
+# REIMS vGPU field investigations — macOS on Linux/Vulkan
 
-A public, privacy-reviewed archive of implementation patches, experimental findings, and negative results from a Linux/Vulkan macOS-guest investigation.
+This repository documents a hands-on, multi-week effort to make an accelerated x86-64 macOS guest useful on Linux/KVM: native Metal and browser WebGL, hardware video, real display streaming, frame pacing, and guest lifecycle. It includes **working source patches, exact replay checks, bounded live measurements and failed experiments**.
 
-**Reference material, not an official release or ready-to-merge upstream PR.** No private guest images, media, firmware, system dumps, raw host logs, hardware identifiers, credentials, IP addresses, hostnames, or absolute machine-specific paths are distributed.
+It is an independent research archive, not an official REIMS release or a collection of upstream-ready PRs.
 
-## Main finding
+## Start here
 
-A repeating 4K HEVC video workload exposed costly synthetic contiguous aliases over scattered guest IOSurface pages, in the optional host registration path. The tested correction **declines optional direct registration for scattered synthetic aliases**, while keeping registration for already contiguous memory. The canonical row-copy fallback remains available and hardware video decode/encode stays enabled.
+| What you're looking for | Where to read |
+|---|---|
+| **The full engineering backlog, seven additional source patches, test scope and measured outcomes** | [Source and performance case index](archive/README.md) |
+| Platform behaviors demonstrated, and claims we cannot independently verify | [Capability and test matrix](CAPABILITIES.md) |
+| Guest FIFO wakeups, Sequoia Metal/Safari compatibility, display clocks, SMC and streaming | [Guest compatibility / operations](guest-compatibility/README.md) |
+| How we measured, and why some plausible optimizations failed | [Research methodology and failed approaches](RESEARCH_METHOD.md) |
+| REIMS video-loop issue and final narrow memory-layout fix | [REIMS #157](https://github.com/steelbrain/reims-vgpu/issues/157) · [accepted implementation](diary/03-accepted-implementation.md) |
+| Metal2Vulkan shadowing, source patches, Spotlight corruption and negative GPU results | [Companion Metal2Vulkan archive](https://github.com/swittk/metal2vulkan-field-notes) |
 
-On one anonymized Linux x86-64 NVIDIA host, the final 260-second original screensaver capture produced approximately 30 FPS, with no QEMU presentation interval above 60 ms (worst 59.6 ms). An independent 150-second native-player loop ran at 59.94 FPS with zero >60 ms intervals (worst 55.36 ms). One isolated 61 ms *capture transport* interval was observed away from loop transitions. These bounded, single-host results do not establish universal zero-jitter behavior.
+## The recurring HEVC video-loop issue
 
-## Repository index
+The final investigation found that optional direct host registration of a video surface could **itself** create thousands of synthetic guest-memory mappings. Declining that optional registration when the guest pages were not naturally contiguous retained direct imports for eligible buffers and the canonical-copy path for scattered ones.
 
-- [Complete 17-file tested delta](patches/complete-loop-fix.patch) relative to a **mixed, recorded local source baseline**.
-- [Narrow final host-import selection delta](patches/native-import-only.patch) relative to the **already modified source**, not independently applicable to upstream master.
-- [Per-file baseline and output SHA-256 manifest](manifest/complete-patch-bases.json), plus [contract checker](tools/check_patch_contract.py).
-- [Patch applicability details](patches/README.md).
-- [Loop-causality diary](diary/01-player-loop.md).
-- [Rejected approaches diary](diary/02-approaches-and-failures.md).
-- [Accepted implementation and test limits](diary/03-accepted-implementation.md).
-- [Final normalized results](results/loop-control.json) and [negative-control results](results/rejected-candidates.json).
-- [Potential upstream discussion and already-open related work](UPSTREAM.md).
+In a bounded final 260-second original screensaver run, QEMU reported 30 FPS with no >60 ms presentation gaps (worst 59.6 ms). A separate 150-second native looping control ran at 59.935 FPS with no >60 ms gaps (worst 55.357 ms). One independent capture-transport interval of 61 ms occurred away from loop transitions. These are not universal GPU or physical-client latency guarantees.
 
-A separate Spotlight ghost-text render-pass issue is tracked at [Metal2Vulkan #17](https://github.com/steelbrain/metal2vulkan/issues/17); this is **not** the VideoToolbox loop defect.
+The original reference artifacts remain available:
+- [Complete historical 17-file local patch](patches/complete-loop-fix.patch), [narrow last-stage decision](patches/native-import-only.patch) and [source identity manifest](manifest/complete-patch-bases.json).
+- [Observed loop characteristics](diary/01-player-loop.md), [failed approaches](diary/02-approaches-and-failures.md) and [accepted validation](diary/03-accepted-implementation.md).
+- [The upstream issue](https://github.com/steelbrain/reims-vgpu/issues/157) shares these observations without asking maintainers to merge the historical patch directly.
 
-The Metal2Vulkan-specific investigation is published separately in [metal2vulkan-field-notes](https://github.com/swittk/metal2vulkan-field-notes).
+## Applicability and provenance
 
-## Upstream issue
+The seven additional archived source patches were all replayed by reversing them from their original recorded final files and applying them forward again, matching source bytes exactly. Their individual SHA-256 preimages and postimages are in each case's source-contract.json, with a [read-only offline checker](tools/README.md).
 
-The bounded VideoToolbox/scattered IOSurface finding is filed at [REIMS #157 — Synthetic host registration and video-loop stalls](https://github.com/steelbrain/reims-vgpu/issues/157). This is a research issue, not an upstream-ready pull request.
+**Source replay does not mean a patch applies to current upstream master, compiles with current APIs, or has a portable performance gain.** These cases come from different incremental versions of our local integrated REIMS and Metal2Vulkan source. Some overlap and must not be stacked blindly. The larger final 17-file patch also uses a mixed baseline. One small QEMU VNC change is from a different upstream project and retains that project's licensing.
 
-## Important patch limitation
+No proprietary Apple firmware/code bundles, VM or iOS device images, raw host logs, machine paths/hostnames, hardware UUIDs, credentials, guest media, or private shader corpus is published.
 
-The final REIMS patch was built from source files coming from more than one recorded local baseline. **There is no single public upstream Git commit to which this 17-file patch can truthfully be said to apply.** A file-by-file SHA contract is provided so researchers can inspect or reconstruct the particular input and output. Upstream integration requires rebase, dependency reconciliation, and independent build/test on current master.
+## License
 
-## License and provenance
+REIMS and Metal2Vulkan derivative source changes retain their original choice of **GPL-2.0-or-later OR LGPL-3.0-or-later**. The QEMU VNC modification retains QEMU's source-file license. Original descriptive text and aggregate measurement tables are offered under **CC BY 4.0**. Existing upstream licenses and authorship remain credited in the corresponding repository sources.
 
-Source modifications inherit **GPL-2.0-or-later OR LGPL-3.0-or-later** as described in LICENSE and LICENSES/. We offer original measurement tables and explanatory prose under CC BY 4.0. This is independent of [steelbrain/reims-vgpu](https://github.com/steelbrain/reims-vgpu). No upstream issue or PR is claimed to have been posted yet.
+Publicly discussed findings are limited to [REIMS #157](https://github.com/steelbrain/reims-vgpu/issues/157) and the companion [Metal2Vulkan #17](https://github.com/steelbrain/metal2vulkan/issues/17) at this time. Other historical source patches are offered as research references, not unsolicited upstream submissions.

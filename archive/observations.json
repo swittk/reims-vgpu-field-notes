@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "scope": "Historically observed single-host and sometimes single-guest sequential finite experiments; no universal performance or hardware compatibility claims",
+  "results": [
+    {
+      "case": "writable-guest-memory-import",
+      "evidence_type": "sampled CPU hotspot + focused GPU import regression",
+      "original_fifo_sample_cycles_in_procfs_writability_percent": 76.8,
+      "kernel_query_count_per_selected_import_before": 2,
+      "after": 0,
+      "additional_effect": "untracked/caller memory keeps the normal permission check",
+      "end_to_end_frame_rate_gain_established": false
+    },
+    {
+      "case": "remote-reply-teardown-deadlock",
+      "evidence_type": "deterministic local concurrency regression",
+      "before_timeout_seconds": 10.01,
+      "after_completion_seconds": 0.01,
+      "focused_tests_passed": 104,
+      "linked_historical_guest_freeze_cause_proven": false
+    },
+    {
+      "case": "external-write-private-backing",
+      "evidence_type": "accepted 1080p moving guest graphics, no active streaming client",
+      "gpu_util_percent_valid_30_second_runs": [
+        19.87,
+        19.83,
+        19.8
+      ],
+      "presentations_per_second": [
+        30.0,
+        30.0,
+        30.0
+      ],
+      "additional_pixel_sequences": {
+        "runs": 3,
+        "unique_frame_checks_per_run": 32,
+        "unchanged_old_frame_returns_observed": 0
+      },
+      "tests": {
+        "backing": 29,
+        "external_generations": 4,
+        "selected_actual_gpu": 31
+      },
+      "other_runs_excluded_for_stall_or_static_image": true
+    },
+    {
+      "case": "backing-revalidation-hevc-reuse",
+      "evidence_type": "source/hardware regressions plus failing live-loop-pacing acceptance",
+      "decoder_hardware_allocations_before": 2,
+      "after": 1,
+      "unchanged_binding_avoidable_mapping_recreations_after": 0,
+      "unchanged_binding_avoidable_uploads_after": 0,
+      "focused_cpu_tests": 223,
+      "selected_actual_gpu_cases": 31,
+      "combined_live_candidate_long_stalls_remained": true,
+      "max_observed_1_second_gap_ms": 1013.2
+    },
+    {
+      "case": "native-video-encoder-alignment",
+      "evidence_type": "guest native encode/decode reference",
+      "tested_encoder_input_without_64_byte_source_requirement": true,
+      "frames_per_codec_and_allocation_mode": 90,
+      "h264_max_mean_frame_error": 0,
+      "hevc_max_mean_frame_error_approx": 0.0001042
+    },
+    {
+      "case": "direct-packed-video-rows",
+      "evidence_type": "source/CPU/GPU validation",
+      "preserves_destination_padding_and_plane_order": true,
+      "avoids_constructing_extra_contiguous_alias_for_eligible_packed_rows": true,
+      "alone_fully_solved_loop_pacing": false
+    },
+    {
+      "case": "qemu-vnc-unchanged-rows",
+      "evidence_type": "differential CPU-only trial with separate client test",
+      "randomized_differential_trials": 1500,
+      "sanitizers": [
+        "AddressSanitizer",
+        "UndefinedBehaviorSanitizer"
+      ],
+      "sparse_full_hd_scan_ms_baseline_range": [
+        0.88,
+        1.07
+      ],
+      "candidate_range": [
+        0.63,
+        0.65
+      ],
+      "normal_client_fps_improvement_established": false
+    }
+  ],
+  "honesty": [
+    "Different stages/snapshots are not randomized matched trials",
+    "Historical patch contract verification is not current upstream applicability",
+    "No device-specific GPU optimization shipped as portable policy",
+    "Original guest media, raw traces and host details not published"
+  ]
+}

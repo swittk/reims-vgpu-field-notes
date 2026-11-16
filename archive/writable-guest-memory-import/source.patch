@@ -1,0 +1,385 @@
+--- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+@@ -1098,7 +1098,7 @@
+                     // keep-alive is dropped, as nothing else frees or remaps it.
+                     unsafe {
+                         (self.raw).rebind_bytes_no_copy(
+-                            crate::os::host_memory(first),
++                            crate::os::host_memory_for_tracked_range(first, length),
+                             None,
+                             Some(keep),
+                         )
+@@ -1878,7 +1878,7 @@
+                     // which is the runtime's import unit on this host.
+                     unsafe {
+                         (self.raw).rebind_bytes_no_copy(
+-                            crate::os::host_memory(first),
++                            crate::os::host_memory_for_tracked_range(first, size),
+                             None,
+                             Some(keep),
+                         )
+@@ -4313,3 +4313,7 @@
+     #[cfg(target_os = "macos")]
+     pub(crate) mod metal_tests;
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++#[path = "resource/tracked_import_tests.rs"]
++mod tracked_import_tests;
+--- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
+@@ -826,9 +826,8 @@
+                 // Reims knows guest-RAM registrations and its own Linux VM aliases'
+                 // write protections. Skip PROCMAP_QUERY (or expensive /proc/self/maps
+                 // fallback on Linux < 6.11) only for ranges proven writable there.
+-                let memory = unsafe {
+-                    crate::os::host_memory_for_tracked_range(imported, bytes.len())
+-                };
++                let memory =
++                    unsafe { crate::os::host_memory_for_tracked_range(imported, bytes.len()) };
+                 let contents = rt::BufferContents::NoCopy {
+                     memory,
+                     deallocator: run,
+@@ -1678,6 +1677,8 @@
+             made => made,
+         };
+         // The alias a heap over address ranges is made over.
++        // The same checked span that gather owns is the only range we vouch for.
++        let import_size = desc.size.checked_next_multiple_of(HEAP_GRANULE);
+         let mut made_over = None;
+         let heap = match desc.address_ranges {
+             None => create(sel, Policy::Dies, nil, || {
+@@ -1688,9 +1689,7 @@
+             })?,
+             Some(_) if desc.size == 0 => None,
+             Some(ranges) => {
+-                made_over = desc
+-                    .size
+-                    .checked_next_multiple_of(HEAP_GRANULE)
++                made_over = import_size
+                     .and_then(|size| backing::gather(sel, &ranges.ranges, size, read_only))
+                     .map(Arc::new);
+                 match made_over
+@@ -1707,7 +1706,10 @@
+                             match token {
+                                 Some(token) => {
+                                     self.raw.new_heap_with_bytes_no_copy_and_range_token(
+-                                        crate::os::host_memory(first),
++                                        crate::os::host_memory_for_tracked_range(
++                                            first,
++                                            import_size.unwrap_or(0),
++                                        ),
+                                         &descriptor,
+                                         None,
+                                         Some(keep),
+@@ -1715,7 +1717,10 @@
+                                     )
+                                 }
+                                 None => self.raw.new_heap_with_bytes_no_copy(
+-                                    crate::os::host_memory(first),
++                                    crate::os::host_memory_for_tracked_range(
++                                        first,
++                                        import_size.unwrap_or(0),
++                                    ),
+                                     &descriptor,
+                                     None,
+                                     Some(keep),
+--- a/crates/reims-vgpu-vulkan/src/gpu/scaler.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/scaler.rs
+@@ -273,7 +273,7 @@
+         keep: Box<dyn Send + 'static>,
+     ) -> Result<GpuBuffer, String> {
+         // SAFETY: the caller's: mapped, writable pages, kept mapped by `keep`.
+-        let memory = unsafe { crate::os::host_memory(first) };
++        let memory = unsafe { crate::os::host_memory_for_tracked_range(first, length.to_u64()) };
+         let contents = rt::BufferContents::NoCopy {
+             memory,
+             deallocator: None,
+--- a/crates/reims-vgpu-vulkan/src/os.rs
++++ b/crates/reims-vgpu-vulkan/src/os.rs
+@@ -37,8 +37,8 @@
+ pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
+ pub(crate) use host_os::{
+     Drawables, ImportView, METAL_LEVEL, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros,
+-    dma_buf_refusal, host_memory, host_memory_for_tracked_range, import_view, plane_shape,
+-    shown_at, surface_memory_hold,
++    dma_buf_refusal, host_memory_for_tracked_range, import_view, plane_shape, shown_at,
++    surface_memory_hold,
+ };
+ pub use host_os::{
+     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_gpu_core_count,
+--- a/crates/reims-vgpu-vulkan/src/os/linux.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux.rs
+@@ -29,8 +29,8 @@
+ pub use vm::LinuxVm;
+ 
+ pub(crate) use import::{
+-    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory,
+-    host_memory_for_tracked_range, import_view, shown_at,
++    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory_for_tracked_range,
++    import_view, shown_at,
+ };
+ pub(crate) use surface::{
+     base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
+--- /dev/null
++++ b/crates/reims-vgpu-vulkan/src/gpu/resource/tracked_import_tests.rs
+@@ -0,0 +1,259 @@
++//! Linux owned-mapping import regression. Actual GPU copy/readback proves backing semantics;
++//! runtime counters separately prove imports do not reparse unrelated kernel mappings.
++use super::*;
++use crate::gpu::device::tests::dev;
++use crate::os::{OsVm, PAGE};
++use crate::platform::tests::platform;
++use reims_vgpu_core::platform::Platform as _;
++use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
++use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
++use reims_vgpu_core::platform::device::GpuDevice as _;
++use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
++use reims_vgpu_core::platform::types::ResourceAddressRange;
++use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
++use std::time::Instant;
++
++struct Pages {
++    at: HostPtr,
++    size: u64,
++}
++impl Pages {
++    fn new(size: u64, seed: u8) -> Self {
++        let at = crate::os::allocate_aliasable(size).unwrap();
++        // SAFETY: this test exclusively owns the live writable mapping; no GPU uses it yet.
++        unsafe {
++            for i in 0..usize::try_from(size).unwrap() {
++                at.as_ptr::<u8>()
++                    .add(i)
++                    .write((i as u8).wrapping_mul(17) ^ seed);
++            }
++        }
++        Self { at, size }
++    }
++}
++impl Drop for Pages {
++    fn drop(&mut self) {
++        // All buffers and completed commands are dropped first, in reverse declaration order.
++        assert!(OsVm::new().deallocate(self.at, self.size).is_success());
++    }
++}
++
++fn copy_and_check(d: &VulkanDevice, source: &VulkanBuffer, length: u64, seed: u8) {
++    let destination = d
++        .new_buffer_of_length(OnFault::Return, length, 0)
++        .unwrap()
++        .unwrap();
++    let queue = d.new_command_queue().unwrap();
++    let commands = queue.command_buffer(OnFault::Return).unwrap().unwrap();
++    let encoder = commands.blit_encoder(OnFault::Return).unwrap().unwrap();
++    encoder
++        .encode(
++            OnFault::Return,
++            BlitCmd::CopyBufferToBuffer {
++                source_buffer: Some(source),
++                source_offset: 0,
++                destination_buffer: Some(&destination),
++                destination_offset: 0,
++                size: length,
++            },
++        )
++        .unwrap();
++    encoder
++        .encode(OnFault::Return, BlitCmd::EndEncoding)
++        .unwrap();
++    commands.commit(OnFault::Return).unwrap();
++    commands.wait_until_completed(OnFault::Return).unwrap();
++    assert!(commands.error().is_none(), "{:?}", commands.error());
++    let contents = destination.contents();
++    assert_ne!(contents, HostPtr::NULL);
++    // SAFETY: command completed, owned destination stays live and no GPU writes it now.
++    let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr::<u8>(), length as usize) };
++    for (i, &seen) in bytes.iter().enumerate() {
++        assert_eq!(seen, (i as u8).wrapping_mul(17) ^ seed, "GPU byte {i}");
++    }
++}
++
++fn isolated(name: &'static str, child: impl FnOnce()) {
++    if std::env::var("REIMS_TRACKED_IMPORT_CHILD").as_deref() == Ok(name) {
++        reims_vgpu_core::testkit::capture::catch_death(child)
++            .expect("unexpected runtime contract refusal");
++        return;
++    }
++    let out = std::process::Command::new(std::env::current_exe().unwrap())
++        .args(["--exact", name, "--nocapture", "--test-threads=1"])
++        .env("REIMS_TRACKED_IMPORT_CHILD", name)
++        .output()
++        .unwrap();
++    print!("{}", String::from_utf8_lossy(&out.stdout));
++    assert!(
++        out.status.success(),
++        "{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++}
++
++/// Replacing a detached buffer uses a fully tracked alias (including a writable twin of
++/// read-only guest pages). It still reads the replacement's exact bytes on the GPU.
++#[test]
++fn owned_buffer_rebind_avoids_kernel_permission_scan() {
++    const NAME: &str =
++        "gpu::resource::tracked_import_tests::owned_buffer_rebind_avoids_kernel_permission_scan";
++    isolated(NAME, || {
++        let p = platform();
++        let d = dev();
++        for read_only in [false, true] {
++            let initial = Pages::new(4 * PAGE, 0x31);
++            let replacement = Pages::new(4 * PAGE, 0x6d);
++            if read_only {
++                OsVm::new()
++                    .protect_max(replacement.at, replacement.size, VmProt::READ)
++                    .unwrap();
++            }
++            // SAFETY: initial remains mapped until the buffer and its finished commands drop.
++            let bytes = unsafe { HostRange::new(initial.at, initial.size) };
++            let buffer = d
++                .new_buffer(BufferDesc {
++                    length: initial.size,
++                    options: vec![OptionSet::StorageMode(0)],
++                    pinned_gpu_address: None,
++                    contents: Some(bytes),
++                    no_copy: true,
++                    deallocator: None,
++                })
++                .unwrap()
++                .unwrap();
++            eprintln!("IMPORT_TEST_PHASE initial_copy");
++            copy_and_check(&d, &buffer, initial.size, 0x31);
++            eprintln!("IMPORT_TEST_PHASE detach_and_rebind");
++            buffer.detach_backing().unwrap();
++            let ranges = p
++                .new_address_range_array(&[ResourceAddressRange {
++                    address: replacement.at.addr() as u64,
++                    length: replacement.size,
++                }])
++                .unwrap();
++            let before = d.raw.work_counts().host_mappings_queried;
++            let started = Instant::now();
++            assert!(buffer.replace_backing(&ranges, read_only).unwrap());
++            let elapsed = started.elapsed();
++            let scans = d.raw.work_counts().host_mappings_queried - before;
++            copy_and_check(&d, &buffer, replacement.size, 0x6d);
++            println!(
++                "BUFFER_REBIND readonly={read_only} queried={scans} elapsed_us={} checked_bytes={}",
++                elapsed.as_micros(),
++                replacement.size
++            );
++            assert_eq!(
++                scans, 0,
++                "The owned alias already proves full writable coverage"
++            );
++        }
++    });
++}
++
++/// An address-range heap's creation and replacement use owned, pinned aliases and keep the
++/// placement's bytes correct without a second whole-process permission scan.
++#[test]
++fn owned_heap_import_and_rebind_avoid_kernel_permission_scan() {
++    const NAME: &str = "gpu::resource::tracked_import_tests::owned_heap_import_and_rebind_avoid_kernel_permission_scan";
++    isolated(NAME, || {
++        let p = platform();
++        let d = dev();
++        const SIZE: u64 = 0x10000;
++        let initial = Pages::new(SIZE, 0x27);
++        let replacement = Pages::new(SIZE, 0x95);
++        let ranges = p
++            .new_address_range_array(&[ResourceAddressRange {
++                address: initial.at.addr() as u64,
++                length: SIZE,
++            }])
++            .unwrap();
++        let before = d.raw.work_counts().host_mappings_queried;
++        let started = Instant::now();
++        let heap = d
++            .new_heap(&HeapDesc {
++                size: SIZE,
++                heap_type: 1,
++                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
++                address_ranges: Some(&ranges),
++                pinned_gpu_address: None,
++            })
++            .unwrap()
++            .heap
++            .unwrap();
++        let import_elapsed = started.elapsed();
++        let imported_scans = d.raw.work_counts().host_mappings_queried - before;
++        let buffer = heap
++            .new_buffer_of_length(PAGE, heap.resource_options(), 0)
++            .unwrap()
++            .unwrap();
++        copy_and_check(&d, &buffer, PAGE, 0x27);
++        heap.detach_backing().unwrap();
++        let new_ranges = p
++            .new_address_range_array(&[ResourceAddressRange {
++                address: replacement.at.addr() as u64,
++                length: SIZE,
++            }])
++            .unwrap();
++        let before = d.raw.work_counts().host_mappings_queried;
++        let started = Instant::now();
++        assert!(heap.replace_backing(&new_ranges, false).unwrap());
++        let rebind_elapsed = started.elapsed();
++        let rebound_scans = d.raw.work_counts().host_mappings_queried - before;
++        copy_and_check(&d, &buffer, PAGE, 0x95);
++        println!(
++            "HEAP_IMPORT queried={imported_scans} elapsed_us={} REBIND queried={rebound_scans} elapsed_us={}",
++            import_elapsed.as_micros(),
++            rebind_elapsed.as_micros()
++        );
++        assert_eq!(
++            (imported_scans, rebound_scans),
++            (0, 0),
++            "Owned heap aliases must not reparse /proc/self/maps"
++        );
++    });
++}
++
++/// Untracked caller memory still reaches the kernel permission check. The optimization must
++/// never infer write access merely from a non-null pointer or a successful previous import.
++#[test]
++fn untracked_buffer_import_retains_kernel_permission_validation() {
++    const NAME: &str = "gpu::resource::tracked_import_tests::untracked_buffer_import_retains_kernel_permission_validation";
++    isolated(NAME, || {
++        use std::alloc::{Layout, alloc_zeroed, dealloc};
++        const SIZE: usize = 4 * PAGE as usize;
++        let layout = Layout::from_size_align(SIZE, SIZE).unwrap();
++        // SAFETY: a fresh aligned caller-owned allocation, never registered as Reims VM pages.
++        let first = unsafe { alloc_zeroed(layout) };
++        assert!(!first.is_null());
++        struct Allocation(*mut u8, Layout);
++        impl Drop for Allocation {
++            fn drop(&mut self) {
++                // SAFETY: the exact live allocation; all buffers and GPU work have ended.
++                unsafe { dealloc(self.0, self.1) };
++            }
++        }
++        let _allocation = Allocation(first, layout);
++        // SAFETY: exclusive live allocation, prior to any GPU access.
++        unsafe {
++            for i in 0..SIZE {
++                first.add(i).write((i as u8).wrapping_mul(17) ^ 0x42);
++            }
++        }
++        let d = dev();
++        let before = d.raw.work_counts().host_mappings_queried;
++        // SAFETY: allocation is declared before the buffer, so it outlives the import.
++        let range = unsafe { HostRange::new(HostPtr::from_ptr(first), SIZE as u64) };
++        let buffer = d
++            .new_buffer_over_host_memory(OnFault::Return, range, 0, None)
++            .unwrap()
++            .unwrap();
++        let scans = d.raw.work_counts().host_mappings_queried - before;
++        copy_and_check(&d, &buffer, SIZE as u64, 0x42);
++        println!("UNTRACKED_IMPORT queried={scans} checked_bytes={SIZE}");
++        assert!(
++            scans > 0,
++            "Unknown permissions must retain runtime/kernel validation"
++        );
++    });
++}

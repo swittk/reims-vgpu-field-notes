@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "upstream_old_baseline_head": "104a35272ff498e1c37a4ee46223c96db83dc222",
+  "patch_sha256": "877438f9123c1db8e83e5e0e3be735ed7396b58fc18095c3582f7ef074118b76",
+  "file": "crates/reims-vgpu-core/src/tasks/remote.rs",
+  "before_sha256": "9a726259bda0cdc1819ca4c7c6ad4c084b03dca43143dc0def1365773e88bcb8",
+  "after_sha256": "bbcc29caa80bd6103f8fc23e0e40ed7cb76926595b10e856fa841ce4671e3e20",
+  "source_patch_applies_to_recorded_git_head": true,
+  "current_upstream_architecture_changed": true,
+  "current_upstream_master_build_tested": false,
+  "test_scope": "deterministic local regression and 104 remote-group tests"
+}

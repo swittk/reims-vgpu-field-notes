@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source": "locally tested historical source snapshot",
+  "patch_path": "source.patch",
+  "patch_sha256": "37bc4fcfbb855816d4338ff676966923f83e9e233c802176b5b83a293c836121",
+  "snapshot_before_after_from_exact_reverse_forward_replay": true,
+  "replay_scope": "only changed source files; not an independently built full project",
+  "applies_to_current_upstream_master": "not verified",
+  "files": [
+    {
+      "path": "reims/crates/reims-vgpu-video-core/src/host/encoder.rs",
+      "before_sha256": "f097649dfa6b489083e2aa2f0f15dc0509c672d46a339890b681c0e6a0f4d265",
+      "after_sha256": "f6fd31680f5e39516c72329f2ff4417d88ca87ee62f2180b958a47d778b393bc"
+    }
+  ]
+}

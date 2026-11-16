@@ -1,0 +1,412 @@
+--- a/crates/reims-vgpu-core/src/tasks/remote.rs
++++ b/crates/reims-vgpu-core/src/tasks/remote.rs
+@@ -27,8 +27,9 @@
+ //!   outstanding token is completed or crashed, then invalidates the link (the service ends),
+ //!   then releases the FIFO events in index order
+ //!   (`drop_waits_for_the_gpu_completion_then_invalidates`).
+-//!   A last reference dropped inside a reply with a token outstanding hangs the link's queue
+-//!   (`the_last_reference_in_a_reply_with_a_token_outstanding_hangs`).
++//!   A last reference released by a reply is let go off the link's queue, so a completion already
++//!   queued behind that reply can run and let the task's drain finish
++//!   (`the_last_reference_in_a_reply_with_a_token_outstanding_completes`).
+ //! - **FIFO events**: a FIFO's event crosses once per stamp index (`setFifoEvent:forIndex:`)
+ //!   before the command that needs it, its handle carried by the message. A FIFO's deletion
+ //!   clears its index after the message (`forwards_then_clears_the_stamp_bit`).
+@@ -63,6 +64,7 @@
+ use crate::platform::{Handle, Platform};
+ use crate::raise::death::DeathSite;
+ use crate::rt::Hold;
++use crate::rt::held::release_off_thread;
+ use crate::seams::links::TaskDeviceLink;
+ use crate::tasks::launcher::{ServiceLink, TaskLauncher};
+ use crate::tasks::wire::{Reply, TaskConfiguration, ToService};
+@@ -122,7 +124,7 @@
+ /// The host's proxy of an isolated user task: the task commands as messages to its service.
+ ///
+ /// Fields drop in declaration order after [`Drop::drop`]: the link, the (emptied) FIFO events,
+-/// then the endpoint.
++/// the endpoint, then the platform.
+ pub struct RemoteTask<P: Platform> {
+     link: Arc<dyn ServiceLink<P>>,
+     /// The event last shared for each stamp index, one slot per FIFO. A slot is touched only by
+@@ -137,6 +139,8 @@
+     pid: AtomicI32,
+     /// This task, for the replies that hold it.
+     me: Weak<RemoteTask<P>>,
++    /// Retains the platform, including its thread service, through teardown.
++    platform: Arc<P>,
+ }
+ 
+ /// The data an exec's reply fills: the ids of the kernel task's shared-texture backings the
+@@ -153,7 +157,91 @@
+ // the reply's closure only calls the struct's `invoke`, so the closure captures the struct whole
+ // (the variables a closure captures by move drop in an unspecified order). The order is fixed: the
+ // tokens first, whose release releases the FIFO's completion (and the FIFO it holds), the task
+-// last, whose drop may block in the drain and then invalidates the link.
++// last. A reply lets its task reference go through `ReplyTask`, so a last reference is released
++// away from the link's delivery queue before its drop drains completions and invalidates the link.
++
++/// A task reference held by a reply.
++///
++/// A non-last reference is released on the reply's delivery queue. A last reference is moved to a
++/// release queue, so [`Drop::drop`]'s completion drain cannot hold up the delivery queue that
++/// may already have the completing message queued behind this reply. The platform stays alive in
++/// both this holder and the task, and the release queue takes its own thread-service handle.
++struct ReplyTask<P: Platform> {
++    task: Option<Arc<RemoteTask<P>>>,
++    platform: Arc<P>,
++    /// The handshake keeps its separate endpoint reference after the task, as before.
++    endpoint_after_task: Option<Arc<Endpoint<P>>>,
++}
++
++impl<P: Platform> ReplyTask<P> {
++    /// A reply whose other endpoint reference is dropped before this holder.
++    fn new(task: Option<Arc<RemoteTask<P>>>, platform: Arc<P>) -> ReplyTask<P> {
++        ReplyTask {
++            task,
++            platform,
++            endpoint_after_task: None,
++        }
++    }
++
++    /// The handshake's task, followed by its separate endpoint reference.
++    fn handshake(
++        task: Arc<RemoteTask<P>>,
++        endpoint: Arc<Endpoint<P>>,
++        platform: Arc<P>,
++    ) -> ReplyTask<P> {
++        ReplyTask {
++            task: Some(task),
++            platform,
++            endpoint_after_task: Some(endpoint),
++        }
++    }
++
++    /// The task held by a handshake reply.
++    fn task(&self) -> &RemoteTask<P> {
++        self.task
++            .as_deref()
++            .expect("handshake reply without its task")
++    }
++
++    /// The separate endpoint held after the handshake's task.
++    fn endpoint_after_task(&self) -> &Endpoint<P> {
++        self.endpoint_after_task
++            .as_deref()
++            .expect("handshake reply without its endpoint")
++    }
++}
++
++/// A last handshake task and the endpoint reference that must be released after it.
++struct LastHandshakeTask<P: Platform> {
++    _task: RemoteTask<P>,
++    _endpoint: Arc<Endpoint<P>>,
++}
++
++impl<P: Platform> Drop for ReplyTask<P> {
++    fn drop(&mut self) {
++        let Some(task) = self.task.take() else {
++            return;
++        };
++        let Some(endpoint) = self.endpoint_after_task.take() else {
++            release_off_thread(self.platform.threads(), task);
++            return;
++        };
++
++        // `Arc::into_inner` consumes this reference atomically. If another reference wins a
++        // last-reference race, this one is released here and that other owner decides where the
++        // task drops. If this one wins, both releases move off the delivery queue, in their
++        // original task-then-endpoint order.
++        if let Some(task) = Arc::into_inner(task) {
++            release_off_thread(
++                self.platform.threads(),
++                Arc::new(LastHandshakeTask {
++                    _task: task,
++                    _endpoint: endpoint,
++                }),
++            );
++        }
++    }
++}
+ 
+ /// A forwarding command's reply: completes its token with the service's status.
+ struct ForwardReply<P: Platform> {
+@@ -163,7 +251,7 @@
+     /// reference.
+     endpoint: Arc<Endpoint<P>>,
+     /// Held for its release: dropped last.
+-    _task: Option<Arc<RemoteTask<P>>>,
++    _task: ReplyTask<P>,
+ }
+ 
+ impl<P: Platform> ForwardReply<P> {
+@@ -186,7 +274,7 @@
+     /// As in [`ForwardReply`].
+     endpoint: Arc<Endpoint<P>>,
+     /// Held for its release: dropped last.
+-    _task: Option<Arc<RemoteTask<P>>>,
++    _task: ReplyTask<P>,
+ }
+ 
+ impl<P: Platform> ExecReply<P> {
+@@ -209,18 +297,19 @@
+ struct HandshakeReply<P: Platform> {
+     /// Dropped first.
+     token: Arc<Token>,
+-    task: Arc<RemoteTask<P>>,
+-    /// The endpoint the construction made, held apart from the task: dropped last.
+-    endpoint: Arc<Endpoint<P>>,
++    /// The task, then the endpoint the construction made: released in that order off the link's
++    /// queue if the task reference is last.
++    task: ReplyTask<P>,
+ }
+ 
+ impl<P: Platform> HandshakeReply<P> {
+     fn invoke(&self, (status, pid): (u32, i32)) {
+-        self.endpoint
++        self.task
++            .endpoint_after_task()
+             .completions()
+             .complete(&self.token, ExecStatus(status));
+         // Stored after the completion, racing the waiter; nothing reads it.
+-        self.task.pid.store(pid, Ordering::Relaxed);
++        self.task.task().pid.store(pid, Ordering::Relaxed);
+     }
+ }
+ 
+@@ -257,6 +346,7 @@
+             shared_fifo_events: AtomicU64::new(0),
+             pid: AtomicI32::new(0),
+             me: me.clone(),
++            platform: platform.clone(),
+         });
+         let device = device.upgrade();
+         // The registry id, then the argument-buffer support; zero and false for a device that is
+@@ -281,8 +371,7 @@
+         let reply = {
+             let reply = HandshakeReply {
+                 token: token.clone(),
+-                task: task.clone(),
+-                endpoint: task.endpoint.clone(),
++                task: ReplyTask::handshake(task.clone(), task.endpoint.clone(), platform.clone()),
+             };
+             Reply::new(move |v: (u32, i32)| reply.invoke(v))
+         };
+@@ -352,7 +441,7 @@
+         let reply = ForwardReply {
+             token,
+             endpoint: self.endpoint.clone(),
+-            _task: self.me.upgrade(),
++            _task: ReplyTask::new(self.me.upgrade(), self.platform.clone()),
+         };
+         Reply::new(move |status: u32| reply.invoke(status))
+     }
+@@ -402,7 +491,7 @@
+                 _token: token.clone(),
+                 backings: backings.clone(),
+                 endpoint: self.endpoint.clone(),
+-                _task: self.me.upgrade(),
++                _task: ReplyTask::new(self.me.upgrade(), self.platform.clone()),
+             };
+             Reply::new(move |v: (u32, Option<Vec<u8>>, u32)| reply.invoke(v))
+         };
+@@ -1267,8 +1356,7 @@
+             }
+             let reply = HandshakeReply {
+                 token: token.clone(),
+-                task: t,
+-                endpoint,
++                task: ReplyTask::handshake(t, endpoint, h.platform.clone()),
+             };
+             let reply = Reply::new(move |v: (u32, i32)| reply.invoke(v));
+             // The link runs the reply once: the token completes and the pid is stored.
+@@ -1279,6 +1367,7 @@
+             assert!(seen.lock().is_empty());
+             // Then releases it, holding the last references.
+             drop(reply);
++            wait_until(|| seen.lock().len() == 2);
+             assert_eq!(
+                 *seen.lock(),
+                 vec![("token", 1), ("endpoint", 0)],
+@@ -1466,44 +1555,51 @@
+             wait_until(|| Arc::strong_count(&t) == 1);
+         }
+ 
+-        /// The last reference dropped inside a reply while a token is outstanding: the drain
+-        /// waits on the link's queue for a `completeAsyncTokenID:` queued behind it.
+-        #[test]
+-        fn the_last_reference_in_a_reply_with_a_token_outstanding_hangs() {
+-            let clock = crate::testkit::VirtualClock::default();
+-            expect_hang(&clock, Duration::from_secs(60), || {
+-                let gate = Gate::default();
+-                let g2 = gate.clone();
+-                let stamp_token = Arc::new(Mutex::new(0u64));
+-                let st2 = stamp_token.clone();
+-                let h = harness(move |ctx, m| match m {
+-                    ToService::ExecIndirect3 {
+-                        gpu_completion,
+-                        reply,
+-                        ..
+-                    } => {
+-                        *st2.lock() = gpu_completion;
+-                        reply.call((1, None, 0));
+-                    }
+-                    ToService::DeleteResource { reply, .. } => {
+-                        g2.wait();
+-                        reply.call(1);
+-                        ctx.complete(*st2.lock(), 1);
+-                    }
+-                    other => standard(ctx, other),
+-                });
+-                let t = h.task();
+-                let v = Arc::new(AtomicU64::new(0));
+-                let (exec_done, d) = done();
+-                exec3(Hold::NONE, &t, None, 0, &v, d);
+-                wait_until(|| Arc::strong_count(&t) == 1);
+-                let (_s, d) = done();
+-                t.delete_resource(5, d);
+-                drop(t);
+-                gate.open();
+-                // The exec's completion never comes: the link's queue is stuck in the drain.
+-                wait_until(|| !exec_done.lock().is_empty());
+-            });
++        /// The last reference released by a reply while a token is outstanding goes off the
++        /// link's queue: the queued `completeAsyncTokenID:` runs, then the drain finishes and
++        /// invalidates the task.
++        #[test]
++        fn the_last_reference_in_a_reply_with_a_token_outstanding_completes() {
++            let gate = Gate::default();
++            let g2 = gate.clone();
++            let stamp_token = Arc::new(Mutex::new(0u64));
++            let st2 = stamp_token.clone();
++            let h = harness(move |ctx, m| match m {
++                ToService::ExecIndirect3 {
++                    gpu_completion,
++                    reply,
++                    ..
++                } => {
++                    *st2.lock() = gpu_completion;
++                    reply.call((1, None, 0));
++                }
++                ToService::DeleteResource { reply, .. } => {
++                    g2.wait();
++                    // These reach the link's queue in this order.
++                    reply.call(1);
++                    ctx.complete(*st2.lock(), 1);
++                }
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let completed: Arc<Mutex<Vec<(&'static str, u32)>>> = Arc::new(Mutex::new(Vec::new()));
++            let c2 = completed.clone();
++            let exec_done: Completion = Arc::new(move |status, _| {
++                c2.lock().push(("exec", status.raw()));
++            });
++            let v = Arc::new(AtomicU64::new(0));
++            exec3(Hold::NONE, &t, None, 0, &v, exec_done);
++            wait_until(|| Arc::strong_count(&t) == 1);
++            let c2 = completed.clone();
++            let delete_done: Completion = Arc::new(move |status, _| {
++                c2.lock().push(("delete", status.raw()));
++            });
++            t.delete_resource(5, delete_done);
++            drop(t);
++            gate.open();
++            wait_until(|| completed.lock().len() == 2);
++            assert_eq!(*completed.lock(), [("delete", 1), ("exec", 1)]);
++            wait_until(|| h.launcher.launched()[0].ended());
+         }
+     }
+ 
+@@ -1550,52 +1646,49 @@
+             wait_until(|| h.launcher.launched()[0].ended());
+         }
+ 
+-        /// With the exec's GPU completion outstanding, the task's drop blocks in the drain on the
+-        /// link's queue for good; the delete's completion (and the FIFO it holds) was released
+-        /// before.
+-        #[test]
+-        fn the_completion_goes_before_the_drop_blocks_in_drain() {
++        /// With the exec's GPU completion outstanding, the delete's completion (and the FIFO it
++        /// holds) is released before the task moves off the link's queue and finishes its drain.
++        #[test]
++        fn the_completion_goes_before_the_task_drops() {
+             let released: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+             let r2 = released.clone();
+-            let clock = crate::testkit::VirtualClock::default();
+-            expect_hang(&clock, Duration::from_secs(60), move || {
+-                let gate = Gate::default();
+-                let g2 = gate.clone();
+-                let stamp_token = Arc::new(Mutex::new(0u64));
+-                let st2 = stamp_token.clone();
+-                let h = harness(move |ctx, m| match m {
+-                    ToService::ExecIndirect3 {
+-                        gpu_completion,
+-                        reply,
+-                        ..
+-                    } => {
+-                        *st2.lock() = gpu_completion;
+-                        reply.call((1, None, 0));
+-                    }
+-                    ToService::DeleteResource { reply, .. } => {
+-                        g2.wait();
+-                        reply.call(1);
+-                        ctx.complete(*st2.lock(), 1);
+-                    }
+-                    other => standard(ctx, other),
+-                });
+-                let t = h.task();
+-                let v = Arc::new(AtomicU64::new(0));
+-                let (exec_done, d) = done();
+-                exec3(Hold::NONE, &t, None, 0, &v, d);
+-                wait_until(|| Arc::strong_count(&t) == 1);
+-                let task = Arc::downgrade(&t);
+-                let r3 = r2.clone();
+-                let (_s, d) = probed_done(move || *r3.lock() = Some(task.strong_count()));
+-                t.delete_resource(5, d);
+-                drop(t);
+-                gate.open();
+-                wait_until(|| r2.lock().is_some());
+-                // The exec's completion never comes: the link's queue is stuck in the drain.
+-                wait_until(|| !exec_done.lock().is_empty());
+-            });
++            let gate = Gate::default();
++            let g2 = gate.clone();
++            let stamp_token = Arc::new(Mutex::new(0u64));
++            let st2 = stamp_token.clone();
++            let h = harness(move |ctx, m| match m {
++                ToService::ExecIndirect3 {
++                    gpu_completion,
++                    reply,
++                    ..
++                } => {
++                    *st2.lock() = gpu_completion;
++                    reply.call((1, None, 0));
++                }
++                ToService::DeleteResource { reply, .. } => {
++                    g2.wait();
++                    reply.call(1);
++                    ctx.complete(*st2.lock(), 1);
++                }
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let v = Arc::new(AtomicU64::new(0));
++            let (exec_done, d) = done();
++            exec3(Hold::NONE, &t, None, 0, &v, d);
++            wait_until(|| Arc::strong_count(&t) == 1);
++            let task = Arc::downgrade(&t);
++            let r3 = r2.clone();
++            let (delete_done, d) = probed_done(move || *r3.lock() = Some(task.strong_count()));
++            t.delete_resource(5, d);
++            drop(t);
++            gate.open();
++            wait_until(|| r2.lock().is_some());
+             // Released while the reply still held the task, before its drop ran.
+             assert_eq!(*released.lock(), Some(1));
++            wait_until(|| *delete_done.lock() == vec![1]);
++            wait_until(|| *exec_done.lock() == vec![1]);
++            wait_until(|| h.launcher.launched()[0].ended());
+         }
+     }
+ 

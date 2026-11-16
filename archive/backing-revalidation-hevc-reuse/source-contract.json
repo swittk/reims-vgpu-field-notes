@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source": "locally tested historical source snapshot",
+  "patch_path": "source.patch",
+  "patch_sha256": "d3c5ab12edf6117d2110ab9420d0db282c9d4ee7c28ac0c2c119c95f9862e1ba",
+  "snapshot_before_after_from_exact_reverse_forward_replay": true,
+  "replay_scope": "only changed source files; not an independently built full project",
+  "applies_to_current_upstream_master": "not verified",
+  "files": [
+    {
+      "path": "crates/reims-vgpu-core/src/lib.rs",
+      "before_sha256": "593f143ecea4fd84712f5df9efe1a6d36346efa4008ca44802c8ae8b9cf3c942",
+      "after_sha256": "23f9ff34d3ee6152fed0426471fa43e760f450526a95b263922030647f2e0c83"
+    },
+    {
+      "path": "crates/reims-vgpu-core/src/resources/texture/backing.rs",
+      "before_sha256": "bbea5330d99a4a0fafd0617a60132fd0485cfda2394347c174415d7138197e12",
+      "after_sha256": "f2b3613ca071208d4bc7e15db3a75e66a5305cd4a67a97c851ee0cfe9e96b2dc"
+    },
+    {
+      "path": "crates/reims-vgpu-video-nvidia/src/decode.rs",
+      "before_sha256": "1e291cbf2ccf96591b0c54065a62e1e460f696d7a58053fbfaa86d13143d1d24",
+      "after_sha256": "fe177b120e01fc4fa2ab3d197ff6db657f38043460713c3733df9fdbaf7f3209"
+    },
+    {
+      "path": "crates/reims-vgpu-video-nvidia/src/nvdec/decoder.rs",
+      "before_sha256": "ac78d4e7cd72a87e9791a0df3a109616b8b82a7e3c897d41cc8dccfe3d385e1d",
+      "after_sha256": "d55a0e08548aa076b3fcda53f871f5af896894a92c261ac46591059562b64a52"
+    },
+    {
+      "path": "crates/reims-vgpu-video-nvidia/src/nvdec/hevc.rs",
+      "before_sha256": "d1e13786a434d4a2905fdd04f27747fb15ed89cc7eca1cae57f56e1ebcd4712b",
+      "after_sha256": "fdf882b0c83f7acb09a01396902eff9212ea92e3265b2f03ba25643c43591b6d"
+    },
+    {
+      "path": "crates/reims-vgpu-core/src/testkit/resource_host.rs",
+      "before_sha256": "d80615c73795b88f9ca2e926eb14bcc30c55320d5082c8c42806990370f034d6",
+      "after_sha256": "527a61459e0145cdc670f42dd5d96bc8c964f917ac6b19c2d05e2743393c7365"
+    }
+  ]
+}

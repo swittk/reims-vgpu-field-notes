@@ -1,0 +1,808 @@
+--- a/crates/reims-vgpu-core/src/lib.rs
++++ b/crates/reims-vgpu-core/src/lib.rs
+@@ -118,7 +118,11 @@
+ 
+     /// Sorted, disjoint half-open ranges of the same underlying RAM, computed once per binding.
+     #[derive(Clone)]
+-    pub struct CanonicalRanges(Arc<Vec<Range<u64>>>, Arc<Mutex<Selection>>);
++    pub struct CanonicalRanges(
++        Arc<Vec<Range<u64>>>,
++        Arc<Mutex<Selection>>,
++        Arc<Vec<Range<u64>>>,
++    );
+ 
+     impl CanonicalRanges {
+         /// Normalize non-reversed canonical ranges, discarding empty intervals and merging overlaps.
+@@ -128,6 +132,9 @@
+                 "reversed canonical RAM range"
+             );
+             ranges.retain(|r| r.start < r.end);
++            // The overlap index is unordered, but backing identity must also preserve page
++            // order and repeated ranges: equal sets alone can describe different pixels.
++            let ordered = Arc::new(ranges.clone());
+             ranges.sort_unstable_by_key(|r| (r.start, r.end));
+             let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+             for range in ranges {
+@@ -137,7 +144,11 @@
+                     merged.push(range);
+                 }
+             }
+-            Self(Arc::new(merged), Arc::new(Mutex::new(Selection::default())))
++            Self(
++                Arc::new(merged),
++                Arc::new(Mutex::new(Selection::default())),
++                ordered,
++            )
+         }
+         #[cfg(test)]
+         pub(crate) fn shares_binding(&self, other: &Self) -> bool {
+@@ -161,6 +172,12 @@
+     }
+ 
+     impl WriteWatch {
++        /// Whether a newly walked binding describes exactly the same ordered canonical bytes.
++        /// This metadata owns no mapping, imported buffer, or guest RAM.
++        pub fn same_binding(&self, current: &CanonicalRanges) -> bool {
++            self.ranges.2 == current.2
++        }
++
+         /// Capture BEFORE recording a prepare; acknowledge this value, never a later read.
+         pub fn generation(&self) -> u64 {
+             self.generation.load(Ordering::Acquire)
+@@ -348,6 +365,26 @@
+         }
+ 
+         #[test]
++        fn binding_identity_preserves_order_multiplicity_and_offsets() {
++            let registry = ExternalWrites::default();
++            let ranges = CanonicalRanges::new(vec![0x1000..0x1800, 0x3000..0x3800]);
++            let watch = registry.watch(ranges.clone());
++            assert!(watch.same_binding(&ranges));
++            assert!(
++                watch.same_binding(&CanonicalRanges::new(vec![0x1000..0x1800, 0x3000..0x3800]))
++            );
++            assert!(
++                !watch.same_binding(&CanonicalRanges::new(vec![0x3000..0x3800, 0x1000..0x1800]))
++            );
++            assert!(
++                !watch.same_binding(&CanonicalRanges::new(vec![0x1000..0x1800, 0x1000..0x1800]))
++            );
++            assert!(
++                !watch.same_binding(&CanonicalRanges::new(vec![0x1001..0x1801, 0x3000..0x3800]))
++            );
++        }
++
++        #[test]
+         fn only_overlapping_canonical_pages_change() {
+             let registry = ExternalWrites::default();
+             let a = registry.watch(CanonicalRanges::new(vec![300..400, 100..200, 200..300]));
+--- a/crates/reims-vgpu-core/src/resources/texture/backing.rs
++++ b/crates/reims-vgpu-core/src/resources/texture/backing.rs
+@@ -2,7 +2,10 @@
+ //! backing record and paged plane by plane between the guest pages and one texture per plane
+ //! over a new IOSurface. It answers no getter: getting its texture or resource is unrecognized.
+ 
+-use std::sync::Arc;
++use std::sync::{
++    Arc,
++    atomic::{AtomicU64, Ordering},
++};
+ 
+ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+ 
+@@ -118,6 +121,10 @@
+     transfer_buffer: Mutex<Option<P::Buffer>>,
+     /// Observed external writes for this transfer binding, and the generation prepared.
+     external: Mutex<Option<(Arc<crate::external_writes::WriteWatch>, u64)>>,
++    /// Every discarded binding needs a new physical-page identity check before cache reuse.
++    discarded: AtomicU64,
++    /// Snapshot acknowledged after a successful walk/bind; a racing later discard stays pending.
++    checked_discard: AtomicU64,
+     /// One texture per plane over the IOSurface.
+     textures: Vec<P::Texture>,
+     /// The guest pages' length.
+@@ -264,6 +271,8 @@
+                     planes: own,
+                     transfer_buffer: Mutex::new(Some(transfer_buffer)),
+                     external: Mutex::new(external),
++                    discarded: AtomicU64::new(0),
++                    checked_discard: AtomicU64::new(0),
+                     textures,
+                     length,
+                     page,
+@@ -277,7 +286,38 @@
+     ///
+     /// The lock is a leaf held only to read or store the field: the task and the encoder are
+     /// asked outside it.
++    fn binding_needs_check(&self) -> bool {
++        let discarded = self.discarded.load(Ordering::Acquire);
++        discarded == u64::MAX || discarded != self.checked_discard.load(Ordering::Acquire)
++    }
++
++    /// Discard still releases guest memory. Reuse only the independently owned GPU pixels
++    /// after a fresh page walk proves the same ordered physical bytes; the retained write
++    /// watch also observes completed writers while no transfer buffer exists.
++    fn check_discarded_binding(&self, hold: Hold<'_>, this: &Resource<P>) -> RaiseResult<()> {
++        let discarded = self.discarded.load(Ordering::Acquire);
++        if discarded != u64::MAX && discarded == self.checked_discard.load(Ordering::Acquire) {
++            return Ok(());
++        }
++        let current = match self.task.upgrade() {
++            Some(task) => task.guest_write_ranges(hold, self.page, self.length)?,
++            None => None,
++        };
++        let same = current.as_ref().is_some_and(|ranges| {
++            self.external
++                .lock()
++                .as_ref()
++                .is_some_and(|(watch, _)| watch.same_binding(ranges))
++        });
++        if !same {
++            this.state.set_host_valid(false);
++        }
++        self.checked_discard.store(discarded, Ordering::Release);
++        Ok(())
++    }
++
+     fn ensure_physical(&self, hold: Hold<'_>) -> RaiseResult<P::Buffer> {
++        let discarded = self.discarded.load(Ordering::Acquire);
+         if let Some(b) = self.transfer_buffer.lock().as_ref() {
+             return Ok(b.clone_ref());
+         }
+@@ -298,12 +338,14 @@
+             None => None,
+         };
+         let copy = made.clone_ref();
+-        *self.external.lock() = external;
++        let old_watch = std::mem::replace(&mut *self.external.lock(), external);
++        drop(old_watch);
+         // A plain store: a buffer a racing caller stored meanwhile is overwritten unreleased,
+         // its GPU VA kept taken.
+         if let Some(raced) = self.transfer_buffer.lock().replace(made) {
+             keep_forever(raced, Kept::MetalNumbering);
+         }
++        self.checked_discard.store(discarded, Ordering::Release);
+         Ok(copy)
+     }
+ 
+@@ -373,11 +415,12 @@
+     fn is_host_valid(&self, this: &Resource<P>) -> bool {
+         this.state.host_valid()
+             && (!this.state.guest_valid()
+-                || self
+-                    .external
+-                    .lock()
+-                    .as_ref()
+-                    .is_none_or(|(watch, recorded)| !watch.changed_since(*recorded)))
++                || (!self.binding_needs_check()
++                    && self
++                        .external
++                        .lock()
++                        .as_ref()
++                        .is_none_or(|(watch, recorded)| !watch.changed_since(*recorded))))
+     }
+ 
+     fn initial_guest_valid(&self) -> bool {
+@@ -394,6 +437,9 @@
+         encoder: Option<&P::BlitEncoder>,
+     ) -> RaiseResult<()> {
+         let state = &this.state;
++        if state.host_valid() && state.guest_valid() {
++            self.check_discarded_binding(hold, this)?;
++        }
+         if self.is_host_valid(this) {
+             return Ok(());
+         }
+@@ -480,16 +526,17 @@
+         Ok(())
+     }
+ 
+-    /// Drops the guest-page binding and its external-write observation. A guest-authoritative
+-    /// observed cache is reloaded at its next binding; GPU-authoritative bytes remain valid.
+-    fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
+-        let observed = self.external.lock().take();
++    /// Release the actual guest-page mapping immediately. Retain only address/generation
++    /// metadata and require fresh identity validation before cached GPU pixels are trusted.
++    fn discard(&self, _this: &Resource<P>) -> RaiseResult<()> {
++        if self.external.lock().is_some() {
++            let _ = self
++                .discarded
++                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
++                    Some(value.saturating_add(1))
++                });
++        }
+         let old = self.transfer_buffer.lock().take();
+-        if observed.is_some() && this.state.guest_valid() {
+-            this.state.set_host_valid(false);
+-        }
+-        // Neither a page mapping nor an observer is dropped under either metadata lock.
+-        drop(observed);
+         drop(old);
+         Ok(())
+     }
+@@ -946,6 +993,258 @@
+         assert!(log.since(mark).is_empty());
+     }
+ 
++    /// Discard releases the guest alias; unchanged, unwritten pages still have valid GPU pixels.
++    #[test]
++    fn unchanged_discarded_binding_does_not_map_or_copy_again() {
++        use crate::external_writes::CanonicalRanges;
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x101000..0x102000]);
++        env.p
++            .script()
++            .push("guest_write_ranges", Step::value(Some(ranges.clone())));
++        let resource = make(&env);
++        let encoder = env.encoder();
++        resource
++            .prepare_in_encoder(Hold::NONE, Some(&encoder))
++            .unwrap();
++        resource.discard().unwrap();
++        assert!(backing(&resource).transfer_buffer.lock().is_none());
++        env.p
++            .script()
++            .push("guest_write_ranges", Step::value(Some(ranges)));
++        let log = env.p.call_log();
++        let mark = log.mark();
++        resource
++            .prepare_in_encoder(Hold::NONE, Some(&encoder))
++            .unwrap();
++        assert!(resource.is_host_valid());
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel == "new_buffer_for_virtual_page")
++                .count(),
++            0,
++            "revalidating an unchanged physical binding must not recreate its guest mapping"
++        );
++        assert!(
++            log.since(mark)
++                .iter()
++                .all(|c| !c.sel.starts_with("copyFromBuffer:"))
++        );
++        assert!(backing(&resource).transfer_buffer.lock().is_none());
++    }
++
++    fn prepared_observed(
++        env: &Env,
++        ranges: crate::external_writes::CanonicalRanges,
++    ) -> Arc<Resource<P>> {
++        env.p
++            .script()
++            .push("guest_write_ranges", Step::value(Some(ranges)));
++        let r = make(env);
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        r
++    }
++
++    #[test]
++    fn writer_while_binding_is_discarded_still_forces_real_refresh() {
++        use crate::external_writes::{CanonicalRanges, process};
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x201000..0x202000]);
++        let r = prepared_observed(&env, ranges.clone());
++        r.discard().unwrap();
++        process().completed_write(&CanonicalRanges::new(vec![0x201800..0x201801]));
++        for _ in 0..2 {
++            env.p
++                .script()
++                .push("guest_write_ranges", Step::value(Some(ranges.clone())));
++        }
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel == "new_buffer_for_virtual_page")
++                .count(),
++            1
++        );
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(log.since(mark).is_empty());
++    }
++
++    #[test]
++    fn changed_or_reordered_guest_pages_cannot_inherit_valid_gpu_pixels() {
++        use crate::external_writes::CanonicalRanges;
++        for current in [
++            vec![0x301800..0x302000, 0x301000..0x301800],
++            vec![0x501000..0x501800, 0x301800..0x302000],
++        ] {
++            let env = Env::new();
++            let old = CanonicalRanges::new(vec![0x301000..0x301800, 0x301800..0x302000]);
++            let r = prepared_observed(&env, old);
++            let old_watch = Arc::downgrade(&backing(&r).external.lock().as_ref().unwrap().0);
++            r.discard().unwrap();
++            let next = CanonicalRanges::new(current);
++            for _ in 0..2 {
++                env.p
++                    .script()
++                    .push("guest_write_ranges", Step::value(Some(next.clone())));
++            }
++            let log = env.p.call_log();
++            let mark = log.mark();
++            r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++                .unwrap();
++            assert!(old_watch.upgrade().is_none());
++            assert!(r.is_host_valid());
++            assert_eq!(
++                log.since(mark)
++                    .iter()
++                    .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                    .count(),
++                2
++            );
++            assert!(
++                backing(&r)
++                    .external
++                    .lock()
++                    .as_ref()
++                    .unwrap()
++                    .0
++                    .same_binding(&next)
++            );
++        }
++    }
++
++    #[test]
++    fn explicit_guest_invalidation_does_not_get_undone_by_equal_page_identity() {
++        use crate::external_writes::CanonicalRanges;
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x601000..0x602000]);
++        let r = prepared_observed(&env, ranges.clone());
++        r.discard().unwrap();
++        r.state.set_host_valid(false);
++        env.p
++            .script()
++            .push("guest_write_ranges", Step::value(Some(ranges)));
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        assert!(r.is_host_valid());
++    }
++
++    #[test]
++    fn a_second_discard_during_revalidation_cannot_be_acknowledged_by_the_old_walk() {
++        use crate::external_writes::CanonicalRanges;
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x701000..0x702000]);
++        let r = prepared_observed(&env, ranges.clone());
++        r.discard().unwrap();
++        let raced = Arc::clone(&r);
++        env.rec
++            .during_next("guest_write_ranges", move || raced.discard().unwrap());
++        for _ in 0..2 {
++            env.p
++                .script()
++                .push("guest_write_ranges", Step::value(Some(ranges.clone())));
++        }
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel == "new_buffer_for_virtual_page")
++                .count(),
++            1
++        );
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        assert!(r.is_host_valid());
++    }
++
++    #[test]
++    fn external_write_during_revalidation_remains_dirty_until_copied() {
++        use crate::external_writes::{CanonicalRanges, process};
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x801000..0x802000]);
++        let r = prepared_observed(&env, ranges.clone());
++        r.discard().unwrap();
++        let written = ranges.clone();
++        env.rec.during_next("guest_write_ranges", move || {
++            process().completed_write(&written)
++        });
++        for _ in 0..2 {
++            env.p
++                .script()
++                .push("guest_write_ranges", Step::value(Some(ranges.clone())));
++        }
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        assert!(r.is_host_valid());
++    }
++
++    #[test]
++    fn failed_identity_walk_keeps_the_discard_pending() {
++        use crate::external_writes::CanonicalRanges;
++        let env = Env::new();
++        let ranges = CanonicalRanges::new(vec![0x901000..0x902000]);
++        let r = prepared_observed(&env, ranges.clone());
++        r.discard().unwrap();
++        env.p.script().push(
++            "guest_write_ranges",
++            Step::raise("NSInternalInconsistencyException", "walk failed"),
++        );
++        assert!(
++            r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++                .is_err()
++        );
++        assert!(!r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++        env.p
++            .script()
++            .push("guest_write_ranges", Step::value(Some(ranges)));
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++    }
++
+     /// Completed external writes trigger exactly one all-plane prepare, not a permanent
+     /// always-refresh policy and not a refresh of unrelated backings.
+     #[test]
+@@ -1005,10 +1304,9 @@
+         );
+     }
+ 
+-    /// Discard retires the observed page identity and forces a fresh guest-authoritative
+-    /// binding, rather than inheriting an acknowledgement for recycled pages.
+-    #[test]
+-    fn observed_discard_drops_watch_and_reloads_guest_authoritative_backing() {
++    /// An unprovable next binding reloads; discard itself retains only observation metadata.
++    #[test]
++    fn observed_discard_revalidates_then_reloads_unprovable_binding() {
+         use crate::external_writes::{CanonicalRanges, ExternalWrites};
+         let env = Env::new();
+         let r = make(&env);
+@@ -1019,13 +1317,14 @@
+         r.state.set_host_valid(true);
+         assert!(r.state.guest_valid());
+         r.discard().unwrap();
+-        assert!(weak.upgrade().is_none());
++        assert!(weak.upgrade().is_some());
+         assert!(!r.is_host_valid());
+         assert!(backing(&r).transfer_buffer.lock().is_none());
+         r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
+             .unwrap();
+         assert!(r.is_host_valid());
+         assert!(backing(&r).transfer_buffer.lock().is_some());
++        assert!(weak.upgrade().is_none());
+     }
+ 
+     /// Retiring a watch must not discard GPU-authoritative data that has yet to be explicitly
+@@ -1043,7 +1342,8 @@
+         r.discard().unwrap();
+         assert!(r.is_host_valid());
+         assert!(!r.state.guest_valid());
+-        assert!(backing(&r).external.lock().is_none());
++        assert!(backing(&r).external.lock().is_some());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
+     }
+ 
+     /// Guest-invalid still prepares; a nil encoder still sets host-valid
+@@ -1153,6 +1453,8 @@
+             planes: vec![plane(0, 1, 1, 4, 4)],
+             transfer_buffer: Mutex::new(None),
+             external: Mutex::new(None),
++            discarded: AtomicU64::new(0),
++            checked_discard: AtomicU64::new(0),
+             textures: Vec::new(),
+             length: 4,
+             page: 0,
+--- a/crates/reims-vgpu-video-nvidia/src/decode.rs
++++ b/crates/reims-vgpu-video-nvidia/src/decode.rs
+@@ -386,7 +386,6 @@
+     /// is refused here. Its frames are P010 at 10 bits and NV12 at 8, in
+     /// the SPS's range.
+     fn open(gpu: &Arc<Gpu>, hvcc: &[u8]) -> Result<Self, Error> {
+-        let decoder = HevcDecoder::from_hvcc(NvdecHevc::new(Arc::clone(gpu)), hvcc)?;
+         let record = Hvcc::parse(hvcc)?;
+         let mut sps = None;
+         for unit in &record.nal_units {
+@@ -395,22 +394,24 @@
+                 break;
+             }
+         }
+-        let format = match &sps {
++        let (format, accelerator) = match &sps {
+             Some(sps) => {
+                 hevc::check_supported(sps)?;
+-                // Opening the decoder asks NVDEC for the stream's size and
+-                // bit depth.
+-                crate::nvdec::decoder::Decoder::new(
+-                    Arc::clone(gpu),
+-                    &crate::nvdec::hevc::spec(sps, 1),
+-                )?;
+-                pixel_format(
+-                    u32::from(sps.bit_depth_luma_minus8) + 8,
+-                    sps.is_full_range(),
++                // The session must reject unsupported/allocation-failing streams here, but
++                // keep the correctly sized decoder instead of constructing and destroying
++                // a four-surface probe before the first frame constructs another decoder.
++                let accelerator = NvdecHevc::prepared(Arc::clone(gpu), sps)?;
++                (
++                    pixel_format(
++                        u32::from(sps.bit_depth_luma_minus8) + 8,
++                        sps.is_full_range(),
++                    ),
++                    accelerator,
+                 )
+             }
+-            None => nv12(false),
++            None => (nv12(false), NvdecHevc::new(Arc::clone(gpu))),
+         };
++        let decoder = HevcDecoder::from_hvcc(accelerator, hvcc)?;
+         Ok(Self {
+             gpu: Arc::clone(gpu),
+             decoder,
+@@ -997,6 +998,83 @@
+         frames
+     }
+ 
++    #[test]
++    #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
++    fn opening_and_decoding_hevc_allocates_one_retained_decoder() {
++        let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
++        let params = EncodeParams {
++            width: 640,
++            height: 360,
++            b_frames: 0,
++            ..params(EncodeProfile::HevcMain)
++        };
++        let mut encoder = NvencEncoder::new(Arc::clone(&gpu), &params).expect("encoder");
++        let sets = nal::split_annex_b(encoder.sequence_parameters());
++        let get = |ty| {
++            *sets
++                .iter()
++                .find(|n| (n[0] >> 1) & 0x3f == ty)
++                .expect("parameter set")
++        };
++        let hvcc =
++            reims_vgpu_video_codec::encode::hevc::hvcc(get(32), get(33), get(34)).expect("hvcC");
++        let mut samples = Vec::new();
++        for n in 0..4 {
++            let (y, uv, row) = noise(&params, n);
++            for packet in encoder
++                .encode(&RawFrame {
++                    luma: (&y, row),
++                    chroma: (&uv, row),
++                    index: n,
++                    force_idr: n == 0,
++                })
++                .expect("encode")
++            {
++                let packet = packet.expect("packet");
++                let mut sample = Vec::new();
++                for unit in nal::split_annex_b(&packet.data) {
++                    if !matches!((unit[0] >> 1) & 0x3f, 32 | 33 | 34) {
++                        nal::push_length_prefixed(&mut sample, unit);
++                    }
++                }
++                samples.push(sample);
++            }
++        }
++        assert_eq!(samples.len(), 4);
++        for _ in 0..2 {
++            let created = crate::nvdec::decoder::tests::CREATED.get();
++            let mut session = HevcSession::open(&gpu, &hvcc).expect("session admission");
++            assert_eq!(crate::nvdec::decoder::tests::CREATED.get(), created + 1);
++            let mut decoded = 0;
++            for (id, sample) in samples.iter().enumerate() {
++                let frame = CompressedFrame {
++                    frame_id: id as i64,
++                    data: sample,
++                    sample_sizes: &[],
++                    presentation_time: MediaTime::INVALID,
++                    decode_time: MediaTime::INVALID,
++                    duration: MediaTime::INVALID,
++                    new_config: None,
++                };
++                for output in session.decode(&frame).expect("decode") {
++                    let pixels = output.read_back().expect("pixels");
++                    drop(pixels);
++                    decoded += 1;
++                }
++            }
++            for output in session.flush().expect("flush") {
++                drop(output.read_back().expect("pixels"));
++                decoded += 1;
++            }
++            assert_eq!(decoded, 4);
++            assert_eq!(
++                crate::nvdec::decoder::tests::CREATED.get(),
++                created + 1,
++                "the admitted decoder must survive first-picture configuration"
++            );
++        }
++    }
++
+     fn stalled(missed: Option<&BackendError>) -> bool {
+         matches!(missed, Some(BackendError::Malfunction(text)) if text.contains("did not finish"))
+     }
+--- a/crates/reims-vgpu-video-nvidia/src/nvdec/decoder.rs
++++ b/crates/reims-vgpu-video-nvidia/src/nvdec/decoder.rs
+@@ -407,6 +407,8 @@
+             let result = unsafe { (nvdec.f.cuvidCreateDecoder)(&raw mut handle, &raw mut info) };
+             gpu.cuda().check("cuvidCreateDecoder", result)?;
+         }
++        #[cfg(test)]
++        tests::CREATED.with(|count| count.set(count.get() + 1));
+         let surface_count = c_int::try_from(surfaces).unwrap_or(1);
+         Ok(Self {
+             inner: Arc::new(Inner {
+@@ -425,6 +427,12 @@
+                 in_flight: AtomicBool::new(false),
+             }),
+         })
++    }
++
++    /// Reuse the admitted allocation only when every hardware requirement is unchanged.
++    /// A timed-out decoder is never resurrected by matching a later stream's specification.
++    pub(crate) fn matches_healthy(&self, spec: &DecoderSpec) -> bool {
++        self.inner.spec == *spec && !self.inner.stalled.load(Ordering::Acquire)
+     }
+ 
+     /// The size every surface has: the spec's.
+@@ -1484,6 +1492,9 @@
+     pub(crate) type BeforeSubmit = Box<dyn FnOnce() + Send>;
+ 
+     thread_local! {
++        /// Successful hardware decoder allocations on this test thread.
++        pub(crate) static CREATED: Cell<usize> = const { Cell::new(0) };
++
+         /// The work the next map on this thread queues first, once.
+         pub(crate) static BEFORE_MAP: RefCell<Option<BeforeMap>> = const { RefCell::new(None) };
+         /// Whether the staging memory made on this thread is pageable, as
+@@ -1504,6 +1515,53 @@
+         if let Some(work) = BEFORE_MAP.with_borrow_mut(Option::take) {
+             work(stream);
+         }
++    }
++
++    #[test]
++    #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
++    fn retained_decoder_requires_exact_spec_and_never_reuses_a_stalled_handle() {
++        let gpu = Arc::new(Gpu::open(&crate::cuda::GpuSelector::First).expect("GPU"));
++        let spec = DecoderSpec {
++            codec: NvdecCodec::Hevc,
++            chroma: ChromaFormat::Yuv420,
++            bit_depth: 8,
++            width: 640,
++            height: 360,
++            surfaces: 9,
++        };
++        let decoder = Decoder::new(gpu, &spec).expect("decoder");
++        assert!(decoder.matches_healthy(&spec));
++        for changed in [
++            DecoderSpec {
++                width: 1280,
++                ..spec
++            },
++            DecoderSpec {
++                height: 720,
++                ..spec
++            },
++            DecoderSpec {
++                bit_depth: 10,
++                ..spec
++            },
++            DecoderSpec {
++                surfaces: 10,
++                ..spec
++            },
++            DecoderSpec {
++                codec: NvdecCodec::H264,
++                ..spec
++            },
++            DecoderSpec {
++                chroma: ChromaFormat::Monochrome,
++                ..spec
++            },
++        ] {
++            assert!(!decoder.matches_healthy(&changed));
++        }
++        // A marker-only check: no timed-out GPU work is created by this regression.
++        decoder.inner.stalled.store(true, Ordering::Release);
++        assert!(!decoder.matches_healthy(&spec));
+     }
+ 
+     fn crop(x: u32, y: u32, width: u32, height: u32) -> Crop {
+--- a/crates/reims-vgpu-video-nvidia/src/nvdec/hevc.rs
++++ b/crates/reims-vgpu-video-nvidia/src/nvdec/hevc.rs
+@@ -36,6 +36,16 @@
+         Self { gpu, decoder: None }
+     }
+ 
++    /// Admit the stream using its real decoded-picture-buffer requirement and keep the
++    /// allocation for its first picture. This is not a disposable capability probe.
++    pub(crate) fn prepared(gpu: Arc<Gpu>, sps: &Sps) -> Result<Self, Error> {
++        let decoder = Decoder::new(Arc::clone(&gpu), &spec(sps, sps.dpb_size()))?;
++        Ok(Self {
++            gpu,
++            decoder: Some(decoder),
++        })
++    }
++
+     fn decoder(&self) -> Result<&Decoder, Error> {
+         self.decoder
+             .as_ref()
+@@ -60,8 +70,16 @@
+     type Error = Error;
+ 
+     fn configure(&mut self, sps: &Sps, dpb_size: usize) -> Result<(), Error> {
++        let required = spec(sps, dpb_size);
++        if self
++            .decoder
++            .as_ref()
++            .is_some_and(|decoder| decoder.matches_healthy(&required))
++        {
++            return Ok(());
++        }
+         self.decoder = None;
+-        self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec(sps, dpb_size))?);
++        self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &required)?);
+         Ok(())
+     }
+ 
+--- a/crates/reims-vgpu-core/src/testkit/resource_host.rs
++++ b/crates/reims-vgpu-core/src/testkit/resource_host.rs
+@@ -177,6 +177,20 @@
+ }
+ 
+ impl ResourceHost<P> for FakeResourceHost {
++    fn guest_write_ranges(
++        &self,
++        _hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        self.thr(
++            Policy::Caught,
++            "guest_write_ranges",
++            vec![Arg::U32(page), Arg::U64(length)],
++            || None,
++        )
++    }
++
+     fn new_buffer_for_virtual_page(
+         &self,
+         _hold: Hold<'_>,

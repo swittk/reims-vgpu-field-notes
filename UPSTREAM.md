@@ -1,20 +1,25 @@
-# Upstream issue #157 (filed; no PR)
+# Existing upstream discussions and possible future contributions
 
-Proposed title: **Linux/Vulkan VideoToolbox: synthetic scattered-page host registration can stall looping playback**
+No additional upstream issue, PR, or comment has been submitted while publishing the larger archive.
 
-Share the actual recurring stalls, the structural fix, negative mapping experiments, observed CPU tradeoff, and a precise statement that our tested patch has NOT been rebased against current upstream master.
+## Published issues
 
-Files worth reviewing in the published patch:
-- reims-vgpu-vulkan/src/os/linux/device_lend.rs — natural-layout eligibility and optional host registration
-- reims-vgpu-vulkan/src/os/linux/surface.rs — whether a surface truly has contiguous host backing
-- reims-vgpu/src/platform/vulkan/lent_memory.rs — refusal and canonical copy fallback
-- reims-vgpu-video-nvidia/src/zero_copy.rs — prerequisite decoder integration; not the narrow final patch
-- reims-vgpu-core/src/resources/texture/backing.rs — immutable staging and guest-write observation prerequisites
+- **[REIMS #157](https://github.com/steelbrain/reims-vgpu/issues/157)** — synthetic scattered guest-page host registration and HEVC loop pacing. The full local source evidence remains on its recorded mixed baseline.
+- **[Metal2Vulkan #17](https://github.com/steelbrain/metal2vulkan/issues/17)** — Clear-loaded color attachment self-read and stale glyph/caret pixels, with a bounded diagnostic implementation.
 
-Do not open duplicate upstream issues for adjacent problems:
-- [REIMS #121: fallback when backend refuses guest RAM import](https://github.com/steelbrain/reims-vgpu/pull/121).
-- [REIMS #106: narrower imported GPU writes](https://github.com/steelbrain/reims-vgpu/pull/106).
-- [REIMS #111: pinned resident growth](https://github.com/steelbrain/reims-vgpu/issues/111), a different lifetime symptom.
-- [metal2vulkan #11: RADV shadowing regression](https://github.com/steelbrain/metal2vulkan/issues/11), which was measured on a different platform.
+## Families worth evaluating before reporting them separately
 
-The issue has been filed, but there is no upstream acceptance or merge. Do not publish proprietary source media or private machine data.
+- [Remote-task reply teardown deadlock](archive/remote-reply-teardown-deadlock/README.md): deterministic local regression and small source patch; compare the present REIMS task architecture, which has moved beyond the recorded source layout.
+- [External-write coherency and GPU-private backing](archive/external-write-private-backing/README.md): significant correctness/performance work with a mixed-source patch; compare current resource/backing semantics and [Metal2Vulkan #11](https://github.com/steelbrain/metal2vulkan/issues/11) before assuming related cause.
+- [Guest-memory import permission checks](archive/writable-guest-memory-import/README.md): measured redundant kernel permission queries; inspect current upstream already using assume_writable before proposing a fix.
+- [NVIDIA decoder reuse and encoder alignment](archive/backing-revalidation-hevc-reuse/README.md): separate testable video subproblems, but source modules have since changed.
+- [Guest-driver FIFO and display timing](guest-compatibility/README.md): very narrow version-specific root-cause reports, not generic host GPU tuning. The separate [REIMS #141](https://github.com/steelbrain/reims-vgpu/issues/141) concerns a different idle-VBL symptom.
+- [QEMU unchanged-row VNC scan](archive/qemu-vnc-unchanged-rows/README.md): small differential-tested QEMU patch, with no proven physical-client benefit.
+
+## Related discussions — avoid duplicate or irrelevant comments
+
+[REIMS #85](https://github.com/steelbrain/reims-vgpu/pull/85) and [#121](https://github.com/steelbrain/reims-vgpu/pull/121) examine guest-memory import fallbacks under other driver conditions; [#106](https://github.com/steelbrain/reims-vgpu/pull/106) concerns narrowing direct writes. Our video-loop root-cause issue #157 is distinct.
+
+[Metal2Vulkan #11](https://github.com/steelbrain/metal2vulkan/issues/11) examines shadowing on RADV. Our NVIDIA [selective-byte-store rejection](https://github.com/swittk/metal2vulkan-field-notes/blob/main/diary/selective-byte-store-regression.md) is independent negative evidence, not an explanation of that report.
+
+The archive prioritizes measured causes and source provenance. Current-upstream correctness/performance validation would be needed before opening new PRs. No maintainer acceptance is presumed.

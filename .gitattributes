@@ -1,0 +1,3 @@
+# Preserve historical source patches byte-for-byte with their SHA-256 contracts.
+# Git whitespace lint applies to docs/code, not raw patch-as-data files.
+archive/**/source.patch -whitespace

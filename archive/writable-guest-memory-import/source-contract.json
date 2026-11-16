@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source": "locally tested historical source snapshot",
+  "patch_path": "source.patch",
+  "patch_sha256": "e29f3f8abc94e2f65d25ce6b12e92479e816097ff3662a20aa8c75c4056227c0",
+  "snapshot_before_after_from_exact_reverse_forward_replay": true,
+  "replay_scope": "only changed source files; not an independently built full project",
+  "applies_to_current_upstream_master": "not verified",
+  "files": [
+    {
+      "path": "crates/reims-vgpu-vulkan/src/gpu/resource.rs",
+      "before_sha256": "484772d9c909745cafd264eee5fdb5fcf4698dfeb7c21cf8b6b1f60d5d2d6095",
+      "after_sha256": "dd7e0bbf2fa77b3a13dac997464d8d3b98664734e104b60663034220acb40c79"
+    },
+    {
+      "path": "crates/reims-vgpu-vulkan/src/gpu/device.rs",
+      "before_sha256": "84decdcdf732ae2ef194807c6ed2622e53cf24099174d63e4311ee0550f9e791",
+      "after_sha256": "a429d79e1b3e07e54e4e7acdd9b948fe0db6b30e09773f6e911a2ee48969ca26"
+    },
+    {
+      "path": "crates/reims-vgpu-vulkan/src/gpu/scaler.rs",
+      "before_sha256": "66016fbec2d038ac5a9e7ca3e87f56ab12b50921e4de8960fa73fba091a8f2da",
+      "after_sha256": "c118d610c3c4809f7c6cef49c6ce4b1d8797f825852766be262f835189e0589c"
+    },
+    {
+      "path": "crates/reims-vgpu-vulkan/src/os.rs",
+      "before_sha256": "4ab73ec57a78a1564acb119bb534b927e95637dc0ad1eb3b649df6604c211207",
+      "after_sha256": "b8a95d3cc823161b0600b489ed18a5bf8d8990c08e184ace515a4d7a5dd750d9"
+    },
+    {
+      "path": "crates/reims-vgpu-vulkan/src/os/linux.rs",
+      "before_sha256": "fc78c6f85922bf3d84d711d154f5924d04d686020e3e7a143a12fb81fcd6d5f6",
+      "after_sha256": "aba73bbcd6328e1a07061b66826b2cf0de1aded4ef59063de2bee57497d1e97b"
+    },
+    {
+      "path": "crates/reims-vgpu-vulkan/src/gpu/resource/tracked_import_tests.rs",
+      "before_sha256": null,
+      "after_sha256": "216cf8583c0d82a85f4ca3f51a42ea1cbf79f14cbb708584fd3c0130e1289745"
+    }
+  ]
+}

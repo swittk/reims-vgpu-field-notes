@@ -1,0 +1,725 @@
+--- a/reims/crates/reims-vgpu-core/src/lib.rs
++++ b/reims/crates/reims-vgpu-core/src/lib.rs
+@@ -55,3 +55,166 @@
+ #[cfg(any(test, feature = "testkit"))]
+ pub mod testkit;
+ pub mod trace;
++
++/// Completed external writes observed by cached legacy resource backings.
++pub mod external_writes {
++    //! Completed external writes to canonical host-RAM ranges, not their virtual aliases.
++    //! Standalone integration primitive; no GPU API, callbacks, pixels, or device identity.
++    use std::{
++        ops::Range,
++        sync::{
++            Arc, Mutex, Weak,
++            atomic::{AtomicU64, Ordering},
++        },
++    };
++    #[derive(Default)]
++    /// Process-local subscriptions to completed writes of canonical RAM ranges.
++    pub struct ExternalWrites {
++        watches: Mutex<Vec<Weak<WriteWatch>>>,
++    }
++    /// A weakly registered observation whose generation changes only for overlapping writes.
++    pub struct WriteWatch {
++        ranges: Vec<Range<u64>>,
++        generation: AtomicU64,
++    }
++    /// Sorted, disjoint half-open ranges of the same underlying RAM, computed once per binding.
++    #[derive(Clone)]
++    pub struct CanonicalRanges(Vec<Range<u64>>);
++    impl CanonicalRanges {
++        /// Normalize non-reversed canonical ranges, discarding empty intervals and merging overlaps.
++        pub fn new(mut ranges: Vec<Range<u64>>) -> Self {
++            assert!(
++                ranges.iter().all(|r| r.start <= r.end),
++                "reversed canonical RAM range"
++            );
++            ranges.retain(|r| r.start < r.end);
++            ranges.sort_unstable_by_key(|r| (r.start, r.end));
++            let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
++            for range in ranges {
++                if let Some(last) = merged.last_mut().filter(|r| range.start <= r.end) {
++                    last.end = last.end.max(range.end);
++                } else {
++                    merged.push(range);
++                }
++            }
++            Self(merged)
++        }
++        fn intersects(&self, other: &[Range<u64>]) -> bool {
++            let (mut i, mut j) = (0, 0);
++            while i < self.0.len() && j < other.len() {
++                let (a, b) = (&self.0[i], &other[j]);
++                if a.end <= b.start {
++                    i += 1;
++                } else if b.end <= a.start {
++                    j += 1;
++                } else {
++                    return true;
++                }
++            }
++            false
++        }
++    }
++    impl WriteWatch {
++        /// Capture BEFORE recording a prepare; acknowledge this value, never a later read.
++        pub fn generation(&self) -> u64 {
++            self.generation.load(Ordering::Acquire)
++        }
++        /// Whether a write followed the acknowledged snapshot; saturation remains conservatively dirty.
++        pub fn changed_since(&self, recorded: u64) -> bool {
++            let current = self.generation();
++            current == u64::MAX || current != recorded
++        }
++    }
++    impl ExternalWrites {
++        /// Call once for each retained backing binding; dropping the returned Arc unsubscribes.
++        pub fn watch(&self, ranges: CanonicalRanges) -> Arc<WriteWatch> {
++            let watch = Arc::new(WriteWatch {
++                ranges: ranges.0,
++                generation: AtomicU64::new(0),
++            });
++            let mut entries = self.watches.lock().unwrap_or_else(|e| e.into_inner());
++            entries.retain(|entry| entry.strong_count() != 0);
++            entries.push(Arc::downgrade(&watch));
++            watch
++        }
++        /// Publish only AFTER the CPU/device write completed and BEFORE notifying its consumer.
++        /// This records no memory, invokes no callbacks, and retains no resource or page binding.
++        pub fn completed_write(&self, written: &CanonicalRanges) {
++            if written.0.is_empty() {
++                return;
++            }
++            let mut entries = self.watches.lock().unwrap_or_else(|e| e.into_inner());
++            entries.retain(|entry| {
++                let Some(watch) = entry.upgrade() else {
++                    return false;
++                };
++                if written.intersects(&watch.ranges) {
++                    let _ = watch.generation.fetch_update(
++                        Ordering::Release,
++                        Ordering::Relaxed,
++                        |value| Some(value.saturating_add(1)),
++                    );
++                }
++                true
++            });
++        }
++    }
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        #[test]
++        fn only_overlapping_canonical_pages_change() {
++            let registry = ExternalWrites::default();
++            let a = registry.watch(CanonicalRanges::new(vec![300..400, 100..200, 200..300]));
++            let b = registry.watch(CanonicalRanges::new(vec![900..1000]));
++            registry.completed_write(&CanonicalRanges::new(vec![200..210, 110..120]));
++            assert_eq!((a.generation(), b.generation()), (1, 0));
++            registry.completed_write(&CanonicalRanges::new(vec![0..100, 400..900]));
++            assert_eq!((a.generation(), b.generation()), (1, 0));
++        }
++        #[test]
++        fn write_during_prepare_is_not_acknowledged_accidentally() {
++            let registry = ExternalWrites::default();
++            let watch = registry.watch(CanonicalRanges::new(vec![100..200]));
++            let recorded = watch.generation();
++            registry.completed_write(&CanonicalRanges::new(vec![120..150]));
++            assert!(watch.changed_since(recorded));
++            let next = watch.generation();
++            assert!(!watch.changed_since(next));
++        }
++        #[test]
++        fn dead_subscriptions_do_not_retain_old_page_identity() {
++            let registry = ExternalWrites::default();
++            let old = registry.watch(CanonicalRanges::new(vec![100..200]));
++            let weak = Arc::downgrade(&old);
++            drop(old);
++            registry.completed_write(&CanonicalRanges::new(vec![100..200]));
++            assert!(weak.upgrade().is_none());
++            assert!(registry.watches.lock().unwrap().is_empty());
++            let new = registry.watch(CanonicalRanges::new(vec![100..200]));
++            assert_eq!(new.generation(), 0);
++        }
++        #[test]
++        fn concurrent_completed_writes_are_not_lost() {
++            let registry = Arc::new(ExternalWrites::default());
++            let watch = registry.watch(CanonicalRanges::new(vec![100..200]));
++            std::thread::scope(|scope| {
++                for _ in 0..2 {
++                    let registry = &registry;
++                    scope.spawn(move || {
++                        for _ in 0..100 {
++                            registry.completed_write(&CanonicalRanges::new(vec![110..120]));
++                        }
++                    });
++                }
++            });
++            assert_eq!(watch.generation(), 200);
++        }
++    }
++
++    /// Process registry; addresses are canonical host RAM, never alternate aliases.
++    pub fn process() -> &'static ExternalWrites {
++        static REGISTRY: std::sync::OnceLock<ExternalWrites> = std::sync::OnceLock::new();
++        REGISTRY.get_or_init(ExternalWrites::default)
++    }
++}
+--- a/reims/crates/reims-vgpu-core/src/resources/host.rs
++++ b/reims/crates/reims-vgpu-core/src/resources/host.rs
+@@ -73,6 +73,18 @@
+         length: u64,
+     ) -> RaiseResult<P::Buffer>;
+ 
++    /// Canonical host-RAM bytes underlying this binding, for observing completed writes
++    /// from another host device. Platforms without this integration retain their old policy.
++    fn guest_write_ranges(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        let _ = (hold, page, length);
++        Ok(None)
++    }
++
+     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
+     /// nothing checks: the backing's validity writes still happen.
+     fn prepare_backing(
+--- a/reims/crates/reims-vgpu-core/src/tasks/local/memory.rs
++++ b/reims/crates/reims-vgpu-core/src/tasks/local/memory.rs
+@@ -293,6 +293,42 @@
+         Ok(MappedAddress::unmapped(
+             self.task_info.base_address.wrapping_add(offset),
+         ))
++    }
++
++    /// Canonical RAM ranges, resolved through the same page walk as the retained transfer
++    /// buffer. The caller invokes this after binding succeeded; no extra mapping is made.
++    pub(super) fn backing_write_ranges(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        let Some(map) = self.device.upgrade().and_then(|d| d.memory_map()) else {
++            return Ok(None);
++        };
++        let Some(walker) = &self.walker else {
++            return Ok(None);
++        };
++        let mut ranges = Vec::new();
++        let mut complete = true;
++        walker.visit_pages_in_range(
++            hold,
++            OnFault::Return,
++            page_address(page),
++            length,
++            &mut |_address, physical_page, _writable| {
++                let at = map.virtual_address_for_physical(page_address(physical_page), PAGE);
++                if at.is_null() {
++                    complete = false;
++                } else if let Some(end) = at.addr().to_u64().checked_add(PAGE) {
++                    ranges.push(at.addr().to_u64()..end);
++                } else {
++                    complete = false;
++                }
++                Ok(true)
++            },
++        )?;
++        Ok(complete.then(|| crate::external_writes::CanonicalRanges::new(ranges)))
+     }
+ 
+     /// A no-copy buffer over the task's pages from `page`, `length` bytes. In the blocks setup
+--- a/reims/crates/reims-vgpu-core/src/tasks/local.rs
++++ b/reims/crates/reims-vgpu-core/src/tasks/local.rs
+@@ -738,6 +738,15 @@
+         self.on_platform(|| self.buffer_for_page(hold, page, length))
+     }
+ 
++    fn guest_write_ranges(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<crate::external_writes::CanonicalRanges>> {
++        self.on_platform(|| self.backing_write_ranges(hold, page, length))
++    }
++
+     fn prepare_backing(
+         &self,
+         hold: Hold<'_>,
+--- a/reims/crates/reims-vgpu-core/src/resources/texture/backing.rs
++++ b/reims/crates/reims-vgpu-core/src/resources/texture/backing.rs
+@@ -116,6 +116,8 @@
+     planes: Vec<BackingPlane>,
+     /// The guest pages: dropped by a discard, bound again by the next paging.
+     transfer_buffer: Mutex<Option<P::Buffer>>,
++    /// Observed external writes for this transfer binding, and the generation prepared.
++    external: Mutex<Option<(Arc<crate::external_writes::WriteWatch>, u64)>>,
+     /// One texture per plane over the IOSurface.
+     textures: Vec<P::Texture>,
+     /// The guest pages' length.
+@@ -192,6 +194,12 @@
+                 drop(io_surface);
+                 return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+             };
++            let external = match &host {
++                Some(t) => t
++                    .guest_write_ranges(hold, page, length)?
++                    .map(|ranges| (crate::external_writes::process().watch(ranges), 0)),
++                None => None,
++            };
+             let mut textures: Vec<P::Texture> = Vec::with_capacity(plane_count);
+             // One descriptor for every plane: made from the first plane's value, then each later
+             // plane's size, usage and pixel format set on it.
+@@ -255,6 +263,7 @@
+                     io_surface,
+                     planes: own,
+                     transfer_buffer: Mutex::new(Some(transfer_buffer)),
++                    external: Mutex::new(external),
+                     textures,
+                     length,
+                     page,
+@@ -282,7 +291,14 @@
+         let Some(made) = made else {
+             return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+         };
++        let external = match self.task.upgrade() {
++            Some(t) => t
++                .guest_write_ranges(hold, self.page, self.length)?
++                .map(|ranges| (crate::external_writes::process().watch(ranges), 0)),
++            None => None,
++        };
+         let copy = made.clone_ref();
++        *self.external.lock() = external;
+         // A plain store: a buffer a racing caller stored meanwhile is overwritten unreleased,
+         // its GPU VA kept taken.
+         if let Some(raced) = self.transfer_buffer.lock().replace(made) {
+@@ -351,6 +367,19 @@
+ }
+ 
+ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
++    /// A completed external writer changes the guest copy without a legacy invalidate
++    /// opcode. Only overlapping registered pages invalidate a guest-authoritative cache;
++    /// host-dirty/guest-invalid data retains the existing synchronization contract.
++    fn is_host_valid(&self, this: &Resource<P>) -> bool {
++        this.state.host_valid()
++            && (!this.state.guest_valid()
++                || self
++                    .external
++                    .lock()
++                    .as_ref()
++                    .is_none_or(|(watch, recorded)| !watch.changed_since(*recorded)))
++    }
++
+     fn initial_guest_valid(&self) -> bool {
+         // A backing starts guest-valid.
+         true
+@@ -365,13 +394,19 @@
+         encoder: Option<&P::BlitEncoder>,
+     ) -> RaiseResult<()> {
+         let state = &this.state;
+-        if state.host_valid() {
++        if self.is_host_valid(this) {
+             return Ok(());
+         }
+         if !state.guest_valid() {
+             log::warn!("preparing a backing whose guest copy is not valid");
+         }
+         let transfer_buffer = self.ensure_physical(hold)?;
++        // Capture BEFORE recording; a writer racing the blit remains dirty for the next use.
++        let prepared = self
++            .external
++            .lock()
++            .as_ref()
++            .map(|(watch, _)| (Arc::clone(watch), watch.generation()));
+         let buffer = &transfer_buffer;
+         for (plane, texture) in self.planes.iter().zip(&self.textures) {
+             // The form without options.
+@@ -394,6 +429,13 @@
+             )?;
+         }
+         state.set_host_valid(true);
++        if let (Some((watch, generation)), Some((current, recorded))) =
++            (prepared, self.external.lock().as_mut())
++        {
++            if Arc::ptr_eq(&watch, current) {
++                *recorded = generation;
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -438,12 +480,16 @@
+         Ok(())
+     }
+ 
+-    /// Drops the guest pages only (no purgeable state, no validity change); the next paging
+-    /// binds them again.
++    /// Drops the guest-page binding and its external-write observation. A guest-authoritative
++    /// observed cache is reloaded at its next binding; GPU-authoritative bytes remain valid.
+     fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
+-        let _ = this;
+-        // 63 on a backing only drops the guest pages.
++        let observed = self.external.lock().take();
+         let old = self.transfer_buffer.lock().take();
++        if observed.is_some() && this.state.guest_valid() {
++            this.state.set_host_valid(false);
++        }
++        // Neither a page mapping nor an observer is dropped under either metadata lock.
++        drop(observed);
+         drop(old);
+         Ok(())
+     }
+@@ -900,6 +946,106 @@
+         assert!(log.since(mark).is_empty());
+     }
+ 
++    /// Completed external writes trigger exactly one all-plane prepare, not a permanent
++    /// always-refresh policy and not a refresh of unrelated backings.
++    #[test]
++    fn external_write_refreshes_once_then_keeps_the_prepared_generation() {
++        use crate::external_writes::{CanonicalRanges, ExternalWrites};
++        let env = Env::new();
++        let r = make(&env);
++        let registry = ExternalWrites::default();
++        let watch = registry.watch(CanonicalRanges::new(vec![0x1000..0x2000]));
++        *backing(&r).external.lock() = Some((watch, 0));
++        let enc = env.encoder();
++        r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++        assert!(r.is_host_valid());
++        registry.completed_write(&CanonicalRanges::new(vec![0x3000..0x4000]));
++        assert!(r.is_host_valid());
++        registry.completed_write(&CanonicalRanges::new(vec![0x1100..0x1200]));
++        assert!(!r.is_host_valid());
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++        assert!(r.is_host_valid());
++        assert_eq!(
++            log.since(mark)
++                .iter()
++                .filter(|c| c.sel.starts_with("copyFromBuffer:"))
++                .count(),
++            2
++        );
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++        assert!(log.since(mark).is_empty());
++    }
++
++    /// A guest-invalid backing still owns GPU writes; an external notification does not
++    /// replace those contents with a stale guest copy.
++    #[test]
++    fn external_write_does_not_overwrite_gpu_authoritative_backing() {
++        use crate::external_writes::{CanonicalRanges, ExternalWrites};
++        let env = Env::new();
++        let r = make(&env);
++        let registry = ExternalWrites::default();
++        let watch = registry.watch(CanonicalRanges::new(vec![0x1000..0x2000]));
++        *backing(&r).external.lock() = Some((watch, 0));
++        r.state.set_host_valid(true);
++        r.state.set_guest_valid(false);
++        registry.completed_write(&CanonicalRanges::new(vec![0x1100..0x1200]));
++        let log = env.p.call_log();
++        let mark = log.mark();
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert!(!r.state.guest_valid());
++        assert!(
++            log.since(mark)
++                .iter()
++                .all(|c| !c.sel.starts_with("copyFromBuffer:"))
++        );
++    }
++
++    /// Discard retires the observed page identity and forces a fresh guest-authoritative
++    /// binding, rather than inheriting an acknowledgement for recycled pages.
++    #[test]
++    fn observed_discard_drops_watch_and_reloads_guest_authoritative_backing() {
++        use crate::external_writes::{CanonicalRanges, ExternalWrites};
++        let env = Env::new();
++        let r = make(&env);
++        let registry = ExternalWrites::default();
++        let watch = registry.watch(CanonicalRanges::new(vec![0x1000..0x2000]));
++        let weak = Arc::downgrade(&watch);
++        *backing(&r).external.lock() = Some((watch, 0));
++        r.state.set_host_valid(true);
++        assert!(r.state.guest_valid());
++        r.discard().unwrap();
++        assert!(weak.upgrade().is_none());
++        assert!(!r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_none());
++        r.prepare_in_encoder(Hold::NONE, Some(&env.encoder()))
++            .unwrap();
++        assert!(r.is_host_valid());
++        assert!(backing(&r).transfer_buffer.lock().is_some());
++    }
++
++    /// Retiring a watch must not discard GPU-authoritative data that has yet to be explicitly
++    /// synchronized to a new guest-page binding.
++    #[test]
++    fn observed_discard_keeps_gpu_authoritative_data() {
++        use crate::external_writes::{CanonicalRanges, ExternalWrites};
++        let env = Env::new();
++        let r = make(&env);
++        let registry = ExternalWrites::default();
++        let watch = registry.watch(CanonicalRanges::new(vec![0x1000..0x2000]));
++        *backing(&r).external.lock() = Some((watch, 0));
++        r.state.set_host_valid(true);
++        r.state.set_guest_valid(false);
++        r.discard().unwrap();
++        assert!(r.is_host_valid());
++        assert!(!r.state.guest_valid());
++        assert!(backing(&r).external.lock().is_none());
++    }
++
+     /// Guest-invalid still prepares; a nil encoder still sets host-valid
+     #[test]
+     fn prepare_guest_invalid_and_nil_encoder() {
+@@ -1006,6 +1152,7 @@
+             io_surface: None,
+             planes: vec![plane(0, 1, 1, 4, 4)],
+             transfer_buffer: Mutex::new(None),
++            external: Mutex::new(None),
+             textures: Vec::new(),
+             length: 4,
+             page: 0,
+--- a/reims/crates/reims-vgpu-core/src/iosurface/device.rs
++++ b/reims/crates/reims-vgpu-core/src/iosurface/device.rs
+@@ -406,6 +406,29 @@
+         })
+     }
+ 
++    /// Canonical RAM touched by a held writable mapping. Caller retains the surface first,
++    /// preventing unmap while this snapshot and its later completed-write notifications live.
++    pub fn completed_write_ranges(
++        &self,
++        mapping_id: u64,
++    ) -> Option<crate::external_writes::CanonicalRanges> {
++        let this = self.block_self()?;
++        self.hw_queue.sync(move || {
++            let st = this.state.lock();
++            let slot = st.slots.get(mapping_id.to_usize())?;
++            if slot.surface.is_none() || slot.host_only || slot.read_only {
++                return None;
++            }
++            let page = this.page_size();
++            let ranges = slot
++                .pages
++                .iter()
++                .filter_map(|&at| at.checked_add(page).map(|end| at..end))
++                .collect();
++            Some(crate::external_writes::CanonicalRanges::new(ranges))
++        })
++    }
++
+     /// Raises interrupt 0 through the block, which is called whether or not the device holds
+     /// one: with none, or one the teardown released and the host freed, the call faults.
+     pub(super) fn raise_interrupt(&self) {
+--- a/reims/crates/reims-vgpu-video-core/src/surfaces.rs
++++ b/reims/crates/reims-vgpu-video-core/src/surfaces.rs
+@@ -61,6 +61,10 @@
+     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
+         None
+     }
++
++    /// Announces a completed device write before the frame is handed back to its consumer.
++    /// CPU lends can publish through `write`; the default has no external legacy cache.
++    fn did_write(&self) {}
+ }
+ 
+ /// A surface's layout.
+--- a/reims/crates/reims-vgpu-video-core/src/host/decoder.rs
++++ b/reims/crates/reims-vgpu-video-core/src/host/decoder.rs
+@@ -1967,6 +1967,8 @@
+         parts.device += clock.elapsed_since(writing);
+         match written {
+             Ok(DeviceWrite::Written) => {
++                // The GPU copy completed; publish before Demt or release reaches the guest.
++                held.surface.did_write();
+                 parts.written += 1;
+                 Some(Ok(()))
+             }
+--- a/reims/crates/reims-vgpu/src/video.rs
++++ b/reims/crates/reims-vgpu/src/video.rs
+@@ -162,6 +162,8 @@
+     /// Its memory as the platform lends it to a device, asked for once
+     /// ([`GuestSurface::device_memory`]).
+     device: OnceLock<Option<Box<dyn DeviceMemory>>>,
++    /// Canonical guest RAM covered by this held mapper surface.
++    written_ranges: Option<reims_vgpu_core::external_writes::CanonicalRanges>,
+ }
+ 
+ impl<P: ApiPlatform> MappedSurface<P> {
+@@ -210,7 +212,8 @@
+     /// Lends its bytes, from its first byte to the end of its allocation, through the platform
+     /// ([`ApiPlatform::lend_surface_bytes`]); a surface they cannot be lent of is unreachable.
+     fn write(&self, write: &mut dyn FnMut(&mut [u8])) -> Result<(), SurfaceError> {
+-        self.platform
++        let written = self
++            .platform
+             .lend_surface_bytes(&self.surface, write)
+             .map_err(|why| {
+                 log::warn!(
+@@ -218,7 +221,9 @@
+                     self.mapping_id
+                 );
+                 SurfaceError::Unreachable(why.to_owned())
+-            })
++            })?;
++        self.did_write();
++        Ok(written)
+     }
+ 
+     /// Lends its bytes for reading, laid out as [`Self::write`] lends them, through the platform
+@@ -240,6 +245,12 @@
+     /// asked for once for this hold: the bytes [`Self::write`] lends, for the decoders' device to
+     /// write a frame into while the session holds the surface. `None` where the platform lends
+     /// none, said once a hold at debug.
++    fn did_write(&self) {
++        if let Some(ranges) = &self.written_ranges {
++            reims_vgpu_core::external_writes::process().completed_write(ranges);
++        }
++    }
++
+     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
+         let lent = self.device.get_or_init(|| {
+             entry::run(|_| self.platform.surface_device_memory(&self.surface))
+@@ -312,6 +323,9 @@
+             ));
+         };
+         let surface = core.retain_surface_with_mapping_id(mapping_id);
++        let written_ranges = surface
++            .as_ref()
++            .and_then(|_| core.completed_write_ranges(mapping_id));
+         drop(core);
+         let surface = surface.ok_or(SurfaceError::Unknown(mapping_id))?;
+         let surface = MappedSurface {
+@@ -319,6 +333,7 @@
+             surface: Ours::new(surface),
+             platform: Arc::clone(&self.platform),
+             device: OnceLock::new(),
++            written_ranges,
+         };
+         log::debug!("surface {mapping_id:#x} held: {surface:?}");
+         Ok(surface)
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -138,6 +138,10 @@
+     made: Mutex<MadeOver>,
+     /// What the host attached to it ([`attachment`]).
+     attached: Attached,
++    /// Only `create_backing`: core-owned staging surfaces are reached through GPU textures
++    /// and explicit prepare/synchronize, never exposed as guest CPU IOSurfaces. Each virtual
++    /// GPU's task-zero backing is used by that GPU's own runtime device and its reference views.
++    legacy_gpu: Option<Mutex<Vec<metal2vulkan_runtime::Buffer>>>,
+     /// For a surface whose GPU writes never reach its memory, its count among the objects whose
+     /// GPU writes may reach read-only memory ([`crate::gpu::writes::any_kept`]).
+     _kept: Option<crate::gpu::writes::Keeping>,
+@@ -659,6 +663,7 @@
+             }),
+             made: Mutex::new(made),
+             attached: Attached::default(),
++            legacy_gpu: None,
+             _kept: kept,
+         }))
+     }
+@@ -706,6 +711,7 @@
+             }),
+             made: Mutex::new(MadeOver::default()),
+             attached: Attached::default(),
++            legacy_gpu: Some(Mutex::new(Vec::new())),
+             _kept: None,
+         }))
+     }
+@@ -1314,3 +1320,37 @@
+         assert!(surfaces.create_backing(&huge).is_none());
+     }
+ }
++
++/// A private GPU buffer for an INTERNAL legacy backing surface. All its plane/ref textures
++/// share the same buffer. Actual guest-page surfaces have `None` and retain the original
++/// imported-memory path. Core still copies to/from its distinct guest transfer buffer.
++/// The disable switch is diagnostic only, for matched residency comparisons.
++pub(crate) fn legacy_backing_buffer(
++    surface: &LinuxSurface,
++    device: &metal2vulkan_runtime::Device,
++) -> Option<Result<metal2vulkan_runtime::Buffer, metal2vulkan_runtime::Error>> {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ENABLED
++        .get_or_init(|| std::env::var("REIMS_DIAG_DISABLE_OWNED_RESIDENCY").as_deref() != Ok("1"))
++    {
++        return None;
++    }
++    let cache = surface.data().legacy_gpu.as_ref()?;
++    let mut buffers = cache.lock();
++    if let Some(buffer) = buffers
++        .iter()
++        .find(|buffer| std::ptr::eq(buffer.device().properties(), device.properties()))
++    {
++        return Some(Ok(buffer.clone()));
++    }
++    // No callback/guest object is released while this metadata lock is held: a private runtime
++    // buffer owns its allocation, not a surface or imported page/deallocator.
++    let made = device.new_buffer(
++        surface.alloc_size(),
++        metal2vulkan_runtime::ResourceOptions::private(),
++    );
++    Some(made.map(|buffer| {
++        buffers.push(buffer.clone());
++        buffer
++    }))
++}
+--- a/reims/crates/reims-vgpu-vulkan/src/os/linux.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os/linux.rs
+@@ -143,3 +143,6 @@
+ pub fn default_gpu_core_count() -> Option<u64> {
+     None
+ }
++
++/// Internal legacy backing copies, never guest-mapped IOSurfaces.
++pub(crate) use surface::legacy_backing_buffer;
+--- a/reims/crates/reims-vgpu-vulkan/src/os.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/os.rs
+@@ -175,3 +175,6 @@
+         }
+     }
+ }
++
++#[cfg(target_os = "linux")]
++pub(crate) use host_os::legacy_backing_buffer;
+--- a/reims/crates/reims-vgpu-vulkan/src/gpu/device.rs
++++ b/reims/crates/reims-vgpu-vulkan/src/gpu/device.rs
+@@ -571,6 +571,12 @@
+         surface: &Arc<OsSurface>,
+         token: rt::RangeToken,
+     ) -> RaiseResult<Option<rt::Buffer>> {
++        #[cfg(target_os = "linux")]
++        if let Some(buffer) = crate::os::legacy_backing_buffer(surface, &self.raw) {
++            let made = create(sel, Policy::Dies, Nil::BufferLength, || buffer);
++            drop(token);
++            return made;
++        }
+         let any = rt::AddressPlacement::Any;
+         self.buffer_over_surface_at(sel, surface, (any, Some(token)), None, Nil::BufferLength)
+     }
+--- a/metal2vulkan-runtime/src/shadow.rs
++++ b/metal2vulkan-runtime/src/shadow.rs
+@@ -253,9 +253,11 @@
+             Ok(StorageMode::Private | StorageMode::Memoryless)
+         );
+         match (surface, buffer.caller_memory(), private) {
++            // Runtime-owned private storage has no external CPU writer, even when viewed
++            // as an internal IOSurface. Imported/caller memory keeps its original policy.
++            (_, None, true) => Backing::PrivateBuffer,
+             (true, _, _) => Backing::Surface,
+             (false, Some(_), _) => Backing::HostPages,
+-            (false, None, true) => Backing::PrivateBuffer,
+             (false, None, false) => Backing::MappedBuffer,
+         }
+     }

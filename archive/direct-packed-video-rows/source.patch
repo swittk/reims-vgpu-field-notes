@@ -1,0 +1,948 @@
+--- a/crates/reims-vgpu-video-core/src/surfaces.rs
++++ b/crates/reims-vgpu-video-core/src/surfaces.rs
+@@ -40,6 +40,15 @@
+     /// Lends the surface's memory for writing: `write` gets every byte of
+     /// the surface, each plane at its [`PlaneLayout::offset`].
+     fn write(&self, write: &mut dyn FnMut(&mut [u8])) -> Result<(), SurfaceError>;
++
++    /// Optionally copy already packed CPU readback planes without a contiguous writable
++    /// alias. None retains the ordinary lend/copy path. A returned result is synchronous:
++    /// all successful bytes and the host's write notification are complete before return.
++    /// Padding and bytes outside the fitting source rows must remain unchanged.
++    fn write_planes(&self, sources: &[PlaneSource<'_>; 2]) -> Option<Result<(), SurfaceError>> {
++        let _ = sources;
++        None
++    }
+ 
+     /// Lends the surface's memory for reading, as [`GuestSurface::write`]
+     /// lends it for writing: the encoder sessions read their source frames
+@@ -180,6 +189,56 @@
+         Ok(ranges)
+     }
+ 
++    /// Validate destination geometry and describe only the bytes copied from packed source
++    /// rows. The returned extent includes all destination planes, even untouched padding;
++    /// a host checks it against its actual allocation before writing any region. Regions
++    /// are in logical destination order. Equal pitches need only one region per plane.
++    pub fn plane_copy_regions<'a>(
++        &self,
++        sources: &[PlaneSource<'a>; 2],
++    ) -> Result<(usize, Vec<(usize, &'a [u8])>), SurfaceError> {
++        let destinations = self.plane_ranges(usize::MAX)?;
++        if destinations.len() < sources.len() {
++            return Err(SurfaceError::Layout);
++        }
++        let extent = destinations
++            .last()
++            .map_or(0, |(offset, length, _, _)| offset + length);
++        let mut writes = Vec::new();
++        for (source, &(offset, _, stride, rows)) in sources.iter().zip(&destinations) {
++            let width = source.bytes_per_row.min(stride);
++            if width == 0 {
++                continue;
++            }
++            let rows = usize::try_from(rows.min(source.rows)).map_err(|_| SurfaceError::Layout)?;
++            let fitting = if source.bytes.len() < width {
++                0
++            } else {
++                1 + (source.bytes.len() - width) / source.bytes_per_row
++            };
++            let rows = rows.min(fitting);
++            if rows == 0 {
++                continue;
++            }
++            if source.bytes_per_row == stride {
++                let bytes = rows.checked_mul(width).ok_or(SurfaceError::Layout)?;
++                writes.push((offset, &source.bytes[..bytes]));
++            } else {
++                for row in 0..rows {
++                    let from = row
++                        .checked_mul(source.bytes_per_row)
++                        .ok_or(SurfaceError::Layout)?;
++                    let to = row
++                        .checked_mul(stride)
++                        .and_then(|n| offset.checked_add(n))
++                        .ok_or(SurfaceError::Layout)?;
++                    writes.push((to, &source.bytes[from..from + width]));
++                }
++            }
++        }
++        Ok((extent, writes))
++    }
++
+     /// Splits a surface's memory into its planes, each from its offset to
+     /// the end of its last row. Planes must be in ascending order without
+     /// overlapping, and each must fit the memory.
+@@ -302,3 +361,170 @@
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod plane_copy_tests {
++    use super::*;
++
++    #[test]
++    fn copy_plan_matches_independent_row_oracle_with_offsets_padding_and_short_sources() {
++        for sample in [1usize, 2] {
++            for width in [1usize, 2, 5, 16] {
++                for height in [1usize, 3, 8] {
++                    for padding in [0usize, 3, 17] {
++                        for shortened in [false, true] {
++                            let widths = [width * sample, width.div_ceil(2) * 2 * sample];
++                            let rows = [height, height.div_ceil(2)];
++                            let pitches = [widths[0] + padding, widths[1] + padding];
++                            let offsets = [3, 3 + pitches[0] * rows[0] + 11];
++                            let extent = offsets[1] + pitches[1] * rows[1];
++                            let storage: Vec<Vec<u8>> = (0..2)
++                                .map(|p| {
++                                    let len = widths[p] * rows[p] - usize::from(shortened);
++                                    (0..len).map(|i| (17 + p * 61 + i * 7) as u8).collect()
++                                })
++                                .collect();
++                            let sources = [
++                                PlaneSource {
++                                    bytes: &storage[0],
++                                    bytes_per_row: widths[0],
++                                    rows: rows[0] as u32,
++                                },
++                                PlaneSource {
++                                    bytes: &storage[1],
++                                    bytes_per_row: widths[1],
++                                    rows: rows[1] as u32,
++                                },
++                            ];
++                            let layout = SurfaceLayout {
++                                pixel_format: FourCc::new(*b"420v"),
++                                width: width as u32,
++                                height: height as u32,
++                                bytes_per_row: 0,
++                                planes: (0..2)
++                                    .map(|p| PlaneLayout {
++                                        offset: offsets[p],
++                                        bytes_per_row: pitches[p],
++                                        width: width as u32,
++                                        height: rows[p] as u32,
++                                    })
++                                    .collect(),
++                            };
++                            let (needed, plan) = layout.plane_copy_regions(&sources).unwrap();
++                            assert_eq!(needed, extent);
++                            let mut actual = vec![0xa5; extent + 7];
++                            for (offset, bytes) in &plan {
++                                actual[*offset..*offset + bytes.len()].copy_from_slice(bytes);
++                            }
++                            let mut expected = vec![0xa5; extent + 7];
++                            for p in 0..2 {
++                                for row in 0..rows[p] {
++                                    let start = row * widths[p];
++                                    if start + widths[p] > storage[p].len() {
++                                        break;
++                                    }
++                                    let dest = offsets[p] + row * pitches[p];
++                                    expected[dest..dest + widths[p]]
++                                        .copy_from_slice(&storage[p][start..start + widths[p]]);
++                                }
++                            }
++                            assert_eq!(actual, expected);
++                            if padding == 0 {
++                                assert!(
++                                    plan.len() <= 2,
++                                    "packed planes must not produce per-row work"
++                                );
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn copy_plan_validates_all_planes_even_when_source_rows_are_empty() {
++        let source = [PlaneSource {
++            bytes: &[],
++            bytes_per_row: 0,
++            rows: 0,
++        }; 2];
++        let layout = SurfaceLayout {
++            pixel_format: FourCc::new(*b"420v"),
++            width: 4,
++            height: 4,
++            bytes_per_row: 0,
++            planes: vec![
++                PlaneLayout {
++                    offset: 0,
++                    bytes_per_row: 8,
++                    width: 4,
++                    height: 4,
++                },
++                PlaneLayout {
++                    offset: 4,
++                    bytes_per_row: 8,
++                    width: 2,
++                    height: 2,
++                },
++            ],
++        };
++        assert_eq!(
++            layout.plane_copy_regions(&source).err(),
++            Some(SurfaceError::Layout)
++        );
++        let mut overflow = layout.clone();
++        overflow.planes[1].offset = usize::MAX;
++        assert_eq!(
++            overflow.plane_copy_regions(&source).err(),
++            Some(SurfaceError::Layout)
++        );
++        let mut one = layout;
++        one.planes.pop();
++        assert_eq!(
++            one.plane_copy_regions(&source).err(),
++            Some(SurfaceError::Layout)
++        );
++    }
++
++    #[test]
++    fn shorter_destination_rows_copy_only_fitting_samples() {
++        let a: Vec<_> = (0..24).collect();
++        let b: Vec<_> = (50..62).collect();
++        let source = [
++            PlaneSource {
++                bytes: &a,
++                bytes_per_row: 8,
++                rows: 3,
++            },
++            PlaneSource {
++                bytes: &b,
++                bytes_per_row: 6,
++                rows: 2,
++            },
++        ];
++        let layout = SurfaceLayout {
++            pixel_format: FourCc::new(*b"420v"),
++            width: 8,
++            height: 3,
++            bytes_per_row: 0,
++            planes: vec![
++                PlaneLayout {
++                    offset: 1,
++                    bytes_per_row: 5,
++                    width: 8,
++                    height: 2,
++                },
++                PlaneLayout {
++                    offset: 20,
++                    bytes_per_row: 4,
++                    width: 4,
++                    height: 1,
++                },
++            ],
++        };
++        let (extent, regions) = layout.plane_copy_regions(&source).unwrap();
++        assert_eq!(extent, 24);
++        assert_eq!(regions, vec![(1, &a[0..5]), (6, &a[8..13]), (20, &b[..4])]);
++    }
++}
+--- a/crates/reims-vgpu-video-core/src/host/decoder.rs
++++ b/crates/reims-vgpu-video-core/src/host/decoder.rs
+@@ -2070,6 +2070,18 @@
+     let read = frame.read_back();
+     parts.read_back += clock.elapsed_since(reading);
+     let read = read.map_err(|error| error.status())?;
++    if let Some(planes) = read.packed_planes() {
++        let copying = clock.now();
++        if let Some(copied) = surface.write_planes(&planes) {
++            let elapsed = clock.elapsed_since(copying);
++            parts.lend += elapsed;
++            parts.fill += elapsed;
++            return copied.map_err(|error| {
++                log::warn!("guest buffer: {error}");
++                Status::VideoDecoderMalfunction.code()
++            });
++        }
++    }
+     let mut copied = Err(Status::VideoDecoderMalfunction.code());
+     let lending = clock.now();
+     let lent = surface.write(&mut |memory| {
+--- a/crates/reims-vgpu/src/video.rs
++++ b/crates/reims-vgpu/src/video.rs
+@@ -226,6 +226,19 @@
+         Ok(written)
+     }
+ 
++    fn write_planes(
++        &self,
++        sources: &[reims_vgpu_video_core::surfaces::PlaneSource<'_>; 2],
++    ) -> Option<Result<(), SurfaceError>> {
++        let written = self
++            .platform
++            .write_surface_planes(&self.surface, &self.layout(), sources)?;
++        if written.is_ok() {
++            self.did_write();
++        }
++        Some(written)
++    }
++
+     /// Lends its bytes for reading, laid out as [`Self::write`] lends them, through the platform
+     /// ([`ApiPlatform::lend_surface_bytes_for_reading`]): a surface the guest made read-only is
+     /// lent too. One they cannot be lent of is unreachable.
+--- a/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -1009,6 +1009,156 @@
+ 
+     const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+ 
++    fn canonical_alias_ptes(first: u64, length: u64) -> Vec<bool> {
++        use std::os::unix::fs::FileExt;
++        let page = page_size();
++        let map = std::fs::File::open("/proc/self/pagemap").unwrap();
++        (0..length.div_ceil(page))
++            .map(|i| {
++                let mut entry = [0u8; 8];
++                map.read_exact_at(&mut entry, (first / page + i) * 8)
++                    .unwrap();
++                u64::from_le_bytes(entry) & (1 << 63) != 0
++            })
++            .collect()
++    }
++
++    #[test]
++    fn canonical_region_copy_keeps_alias_ptes_cold_and_preserves_order_and_padding() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(8);
++        let mut spec = live_spec(ranges.into_iter().rev().collect(), false);
++        spec.offset = 37;
++        let surface = LinuxSurfaces::new().create(&spec).unwrap();
++        let (alias, covered) = mapped_range(&surface).unwrap();
++        assert!(canonical_alias_ptes(alias, covered).iter().all(|v| !*v));
++        let first: Vec<u8> = (0..(page * 2 + 137).to_usize())
++            .map(|i| (i * 7 + 29) as u8)
++            .collect();
++        let second = vec![0xb7; 47];
++        let regions = vec![
++            (page.to_usize() - 53, first.as_slice()),
++            ((page * 5).to_usize() + 19, second.as_slice()),
++        ];
++        // SAFETY: the private test owns this initialized canonical allocation and no device uses it.
++        let mut expected = unsafe {
++            std::slice::from_raw_parts(
++                std::ptr::with_exposed_provenance::<u8>(at.to_usize()),
++                (page * 8).to_usize(),
++            )
++        }
++        .to_vec();
++        for (offset, bytes) in &regions {
++            for (i, byte) in bytes.iter().enumerate() {
++                let logical = 37 + offset + i;
++                let physical =
++                    (7 - logical / page.to_usize()) * page.to_usize() + logical % page.to_usize();
++                expected[physical] = *byte;
++            }
++        }
++        crate::os::copy_surface_regions(&surface, (page * 7).to_usize(), &regions).unwrap();
++        let cold = canonical_alias_ptes(alias, covered).iter().all(|v| !*v);
++        // SAFETY: synchronous copy completed; owned canonical allocation is still live.
++        let actual = unsafe {
++            std::slice::from_raw_parts(
++                std::ptr::with_exposed_provenance::<u8>(at.to_usize()),
++                (page * 8).to_usize(),
++            )
++        };
++        assert_eq!(actual, expected.as_slice());
++        drop(surface);
++        free(at, page * 8);
++        assert!(cold, "CPU copy must not fault a second alias page table");
++    }
++
++    #[test]
++    fn canonical_region_copy_rejects_protection_and_bad_layout_before_any_write() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(3);
++        let surfaces = LinuxSurfaces::new();
++        let readonly = surfaces.create(&live_spec(ranges.clone(), true)).unwrap();
++        let writable = surfaces.create(&live_spec(ranges, false)).unwrap();
++        let protected = surfaces
++            .create(&SurfaceSpec {
++                protection_options: 1,
++                ..host_only()
++            })
++            .unwrap();
++        for surface in [&readonly, &protected] {
++            assert!(crate::os::copy_surface_regions(surface, 1, &[(0, &[9])]).is_err());
++        }
++        assert!(
++            crate::os::copy_surface_regions(&writable, (page * 3 + 1).to_usize(), &[(0, &[9])])
++                .is_err()
++        );
++        assert!(crate::os::copy_surface_regions(&writable, 10, &[(0, &[9]), (11, &[8])]).is_err());
++        assert!(crate::os::copy_surface_regions(&writable, 10, &[(5, &[9]), (3, &[8])]).is_err());
++        assert_eq!(read(at), 0);
++        assert_eq!(read(at + 5), 0);
++        let own = surfaces.create(&host_only()).unwrap();
++        crate::os::copy_surface_regions(&own, 2, &[(0, &[61, 62])]).unwrap();
++        let base = own.base_address().addr().to_u64();
++        assert_eq!((read(base), read(base + 1)), (61, 62));
++        drop((readonly, writable, protected, own));
++        free(at, page * 3);
++    }
++
++    #[test]
++    fn canonical_region_copy_sees_hole_punch_and_new_backing_pages() {
++        use std::os::fd::AsRawFd;
++        let page = page_size();
++        let (at, ranges) = guest_pages(4);
++        let surface = LinuxSurfaces::new()
++            .create(&live_spec(ranges.into_iter().rev().collect(), false))
++            .unwrap();
++        crate::os::copy_surface_regions(&surface, 1, &[(0, &[77])]).unwrap();
++        assert_eq!(read(at + 3 * page), 77);
++        let pieces = super::super::files::pieces(at + 3 * page, page).unwrap();
++        let piece = &pieces[0];
++        // SAFETY: hole is inside our own private, unpinned file allocation, with no live device.
++        let result = unsafe {
++            libc::fallocate(
++                piece.backing.fd.as_raw_fd(),
++                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
++                piece.backing.offset as libc::off_t,
++                page as libc::off_t,
++            )
++        };
++        assert_eq!(result, 0);
++        assert_eq!(read(at + 3 * page), 0);
++        crate::os::copy_surface_regions(&surface, 1, &[(0, &[91])]).unwrap();
++        assert_eq!(read(at + 3 * page), 91);
++        assert_eq!(read(surface.base_address().addr().to_u64()), 91);
++        drop(pieces);
++        drop(surface);
++        free(at, page * 4);
++    }
++
++    #[test]
++    fn canonical_region_copy_handles_repeated_pages_and_overlapping_host_sources() {
++        let page = page_size();
++        let (at, ranges) = guest_pages(2);
++        let surface = LinuxSurfaces::new()
++            .create(&live_spec(vec![ranges[0], ranges[1], ranges[0]], false))
++            .unwrap();
++        crate::os::copy_surface_regions(
++            &surface,
++            (page * 3).to_usize(),
++            &[(0, &[7, 8]), ((page * 2).to_usize(), &[11, 12])],
++        )
++        .unwrap();
++        assert_eq!((read(at), read(at + 1)), (11, 12));
++        // SAFETY: the same private canonical test allocation is live; the copy snapshots overlap
++        // before writes, and this source reference is not used after the synchronous operation.
++        let source = unsafe {
++            std::slice::from_raw_parts(std::ptr::with_exposed_provenance::<u8>(at.to_usize()), 2)
++        };
++        crate::os::copy_surface_regions(&surface, page.to_usize(), &[(1, source)]).unwrap();
++        assert_eq!((read(at), read(at + 1), read(at + 2)), (11, 11, 12));
++        drop(surface);
++        free(at, page * 2);
++    }
++
+     fn host_only() -> SurfaceSpec {
+         SurfaceSpec {
+             pixel_format: BGRA,
+--- a/crates/reims-vgpu-vulkan/src/os.rs
++++ b/crates/reims-vgpu-vulkan/src/os.rs
+@@ -51,6 +51,8 @@
+ pub(crate) use host_os::{PAGE, mapped, writable};
+ #[cfg(all(test, target_os = "macos"))]
+ pub(crate) use macos::MATRIX_KEY;
++#[cfg(target_os = "linux")]
++pub use surface::copy_surface_regions;
+ pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
+ pub use wsi::{add_window_extensions, present_fences};
+ 
+--- a/crates/reims-vgpu-video-nvidia/src/decode.rs
++++ b/crates/reims-vgpu-video-nvidia/src/decode.rs
+@@ -873,6 +873,10 @@
+ struct NvidiaReadBack<'a>(PictureReadBack<'a>);
+ 
+ impl FrameReadBack for NvidiaReadBack<'_> {
++    fn packed_planes(&self) -> Option<[reims_vgpu_video_core::surfaces::PlaneSource<'_>; 2]> {
++        Some(self.0.packed_planes())
++    }
++
+     fn copy_to(&self, planes: &mut [PlaneDestination<'_>]) -> Result<(), BackendError> {
+         let [luma, chroma, ..] = planes else {
+             return Err(BackendError::Malfunction(format!(
+@@ -1019,6 +1023,56 @@
+         }
+         frames.extend(session.decoder.flush().into_iter().map(frame));
+         frames
++    }
++
++    #[test]
++    #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
++    fn packed_readback_rows_match_ordinary_copy_without_another_readback() {
++        let gpu = Arc::new(Gpu::open(&GpuSelector::First).unwrap());
++        let (avcc, samples) = h264(&gpu, (1920, 1080), 3);
++        let mut session = H264Session::open(&gpu, &avcc).unwrap();
++        let frames = decoded(&mut session, &samples);
++        assert_eq!(frames.len(), 3);
++        for frame in &frames {
++            let read = frame.read_back().unwrap();
++            let packed = read
++                .packed_planes()
++                .expect("NVIDIA staging must expose packed crop rows");
++            for padding in [0usize, 13, 64] {
++                let stride = 1920 + padding;
++                let mut luma = vec![0xa5; stride * 1080];
++                let mut chroma = vec![0xa5; stride * 540];
++                read.copy_to(&mut [
++                    PlaneDestination {
++                        bytes: &mut luma,
++                        bytes_per_row: stride,
++                        rows: 1080,
++                    },
++                    PlaneDestination {
++                        bytes: &mut chroma,
++                        bytes_per_row: stride,
++                        rows: 540,
++                    },
++                ])
++                .unwrap();
++                for (source, dest, rows) in
++                    [(&packed[0], &luma, 1080usize), (&packed[1], &chroma, 540)]
++                {
++                    assert_eq!((source.bytes_per_row, source.rows as usize), (1920, rows));
++                    for row in 0..rows {
++                        assert_eq!(
++                            &dest[row * stride..row * stride + 1920],
++                            &source.bytes[row * 1920..(row + 1) * 1920]
++                        );
++                        assert!(
++                            dest[row * stride + 1920..(row + 1) * stride]
++                                .iter()
++                                .all(|v| *v == 0xa5)
++                        );
++                    }
++                }
++            }
++        }
+     }
+ 
+     #[test]
+--- a/crates/reims-vgpu-video-nvidia/src/nvdec/decoder.rs
++++ b/crates/reims-vgpu-video-nvidia/src/nvdec/decoder.rs
+@@ -837,6 +837,18 @@
+ }
+ 
+ impl PictureReadBack<'_> {
++    /// The crop is already complete in packed staging memory. Expose those immutable rows
++    /// while this readback holds the staging lock, so a host can copy into its canonical
++    /// guest pages without constructing or faulting a second contiguous view.
++    pub(crate) fn packed_planes(&self) -> [reims_vgpu_video_core::surfaces::PlaneSource<'_>; 2] {
++        self.planes
++            .map(|plane| reims_vgpu_video_core::surfaces::PlaneSource {
++                bytes: &self.staging.bytes()[plane.offset..plane.offset + plane.len()],
++                bytes_per_row: plane.row_bytes,
++                rows: plane.rows,
++            })
++    }
++
+     /// Copies the read back crop into `luma` and `chroma`, as much as fits,
+     /// as [`copy_plane`] copies out of a mapped surface: the CPU's copy
+     /// alone.
+--- a/crates/reims-vgpu-video-core/src/backend.rs
++++ b/crates/reims-vgpu-video-core/src/backend.rs
+@@ -369,6 +369,13 @@
+ /// A decoded frame read back where the CPU reaches it
+ /// ([`DecodedFrame::read_back`]), and kept there until dropped.
+ pub trait FrameReadBack {
++    /// Cropped, tightly packed source rows when the readback can expose them directly.
++    /// Their lifetime is this readback's completed CPU storage. The default leaves copying
++    /// to copy_to, so driver-backed and conversion readbacks keep their existing behavior.
++    fn packed_planes(&self) -> Option<[crate::surfaces::PlaneSource<'_>; 2]> {
++        None
++    }
++
+     /// Copies the frame into `planes`: the luma plane, then the chroma
+     /// plane, each with its own bytes per row. A destination with fewer
+     /// rows or narrower rows than the frame takes what fits. The CPU's
+--- a/crates/reims-vgpu-video-core/src/host/decoder/tests.rs
++++ b/crates/reims-vgpu-video-core/src/host/decoder/tests.rs
+@@ -9,7 +9,7 @@
+ 
+ use std::collections::{HashMap, VecDeque};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::mpsc::{self, Sender};
+ use std::thread::JoinHandle;
+ use std::time::Duration;
+@@ -94,6 +94,7 @@
+ /// device's write as a read back does.
+ #[derive(Default)]
+ struct FrameWork {
++    packed_readback: AtomicBool,
+     wait: Gate,
+     copy: Gate,
+     copy_time: Mutex<Duration>,
+@@ -345,6 +346,14 @@
+     fn read_back(&self) -> Result<Box<dyn FrameReadBack + '_>, BackendError> {
+         self.work.copy.pass();
+         std::thread::sleep(*self.work.copy_time.lock());
++        if self.work.packed_readback.load(Ordering::SeqCst) {
++            let stride = self.width as usize;
++            return Ok(Box::new(PackedPattern {
++                frame: self,
++                luma: vec![self.luma; stride * self.height as usize],
++                chroma: vec![self.chroma; stride * self.height.div_ceil(2) as usize],
++            }));
++        }
+         Ok(read_back_by(|planes| self.copy_to(planes)))
+     }
+ 
+@@ -409,6 +418,31 @@
+     }
+ }
+ 
++struct PackedPattern<'a> {
++    frame: &'a PatternFrame,
++    luma: Vec<u8>,
++    chroma: Vec<u8>,
++}
++impl FrameReadBack for PackedPattern<'_> {
++    fn packed_planes(&self) -> Option<[crate::surfaces::PlaneSource<'_>; 2]> {
++        Some([
++            crate::surfaces::PlaneSource {
++                bytes: &self.luma,
++                bytes_per_row: self.frame.width as usize,
++                rows: self.frame.height,
++            },
++            crate::surfaces::PlaneSource {
++                bytes: &self.chroma,
++                bytes_per_row: self.frame.width as usize,
++                rows: self.frame.height.div_ceil(2),
++            },
++        ])
++    }
++    fn copy_to(&self, planes: &mut [PlaneDestination<'_>]) -> Result<(), BackendError> {
++        self.frame.copy_to(planes)
++    }
++}
++
+ impl PatternFrame {
+     fn copy_to(&self, planes: &mut [PlaneDestination<'_>]) -> Result<(), BackendError> {
+         let stride = usize::try_from(self.width).unwrap_or(0);
+@@ -433,7 +467,16 @@
+ /// The guest's IOSurfaces, as the host's mapper reaches them: memory by
+ /// mapping ID, and the holds the host has on each.
+ #[derive(Default)]
++struct ScatterStats {
++    enabled: AtomicBool,
++    copied: AtomicUsize,
++    lends: AtomicUsize,
++    notifications: AtomicUsize,
++}
++
++#[derive(Default)]
+ struct GuestMemory {
++    scatter: Arc<ScatterStats>,
+     surfaces: Mutex<HashMap<u64, Arc<SurfaceMemory>>>,
+     holds: Arc<Mutex<HashMap<u64, usize>>>,
+     /// What runs, once, as the host lets go of its hold on a surface, by
+@@ -455,6 +498,7 @@
+ }
+ 
+ struct HeldSurface {
++    scatter: Arc<ScatterStats>,
+     mapping_id: u64,
+     memory: Arc<SurfaceMemory>,
+     holds: Arc<Mutex<HashMap<u64, usize>>>,
+@@ -514,7 +558,37 @@
+             ));
+         }
+         write(&mut self.memory.bytes.lock());
++        self.scatter.lends.fetch_add(1, Ordering::SeqCst);
++        self.did_write();
+         Ok(())
++    }
++
++    fn write_planes(
++        &self,
++        sources: &[crate::surfaces::PlaneSource<'_>; 2],
++    ) -> Option<Result<(), SurfaceError>> {
++        if !self.scatter.enabled.load(Ordering::SeqCst) {
++            return None;
++        }
++        Some((|| {
++            if self.memory.read_only {
++                return Err(SurfaceError::Unreachable("read-only".into()));
++            }
++            let (extent, regions) = self.memory.layout.plane_copy_regions(sources)?;
++            let mut memory = self.memory.bytes.lock();
++            if extent > memory.len() {
++                return Err(SurfaceError::Layout);
++            }
++            for (at, bytes) in regions {
++                memory[at..at + bytes.len()].copy_from_slice(bytes);
++            }
++            self.scatter.copied.fetch_add(1, Ordering::SeqCst);
++            self.did_write();
++            Ok(())
++        })())
++    }
++    fn did_write(&self) {
++        self.scatter.notifications.fetch_add(1, Ordering::SeqCst);
+     }
+ 
+     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
+@@ -545,6 +619,7 @@
+             .ok_or(SurfaceError::Unknown(mapping_id.0))?;
+         *self.holds.lock().entry(mapping_id.0).or_default() += 1;
+         Ok(Box::new(HeldSurface {
++            scatter: Arc::clone(&self.scatter),
+             mapping_id: mapping_id.0,
+             device: StandInDevice {
+                 identity: memory.life.identity(),
+@@ -4062,3 +4137,80 @@
+     }
+     Ok(())
+ }
++
++#[test]
++fn packed_cpu_readback_uses_optional_scatter_or_unchanged_fallback() -> Result<(), WireError> {
++    for packed in [false, true] {
++        for scatter in [false, true] {
++            let guest = Guest::new();
++            guest
++                .backend
++                .frames
++                .packed_readback
++                .store(packed, Ordering::SeqCst);
++            guest
++                .memory
++                .scatter
++                .enabled
++                .store(scatter, Ordering::SeqCst);
++            guest.open()?;
++            assert_eq!(guest.start()?, NO_ERROR);
++            guest.seen();
++            guest.decode(1, 0, &sample(vec![0x41, 0x91], Some(format(AVCC))))?;
++            guest.seen_once(4);
++            assert_eq!(guest.emitted()[0].samples, Some([0x41, 0x41, 0, 0x91]));
++            let stats = &guest.memory.scatter;
++            assert_eq!(
++                stats.copied.load(Ordering::SeqCst),
++                usize::from(packed && scatter)
++            );
++            assert_eq!(
++                stats.lends.load(Ordering::SeqCst),
++                usize::from(!(packed && scatter))
++            );
++            assert_eq!(
++                stats.notifications.load(Ordering::SeqCst),
++                1,
++                "publish complete bytes exactly once"
++            );
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn packed_cpu_readback_rejects_read_only_and_does_not_replace_device_writes()
++-> Result<(), WireError> {
++    for device in [false, true] {
++        let guest = Guest::new();
++        guest
++            .backend
++            .frames
++            .packed_readback
++            .store(true, Ordering::SeqCst);
++        guest.memory.scatter.enabled.store(true, Ordering::SeqCst);
++        if device {
++            guest
++                .backend
++                .frames
++                .device_writes
++                .store(true, Ordering::SeqCst);
++        } else {
++            guest.state.read_only_buffers.store(true, Ordering::SeqCst);
++        }
++        guest.open()?;
++        assert_eq!(guest.start()?, NO_ERROR);
++        guest.seen();
++        guest.decode(1, 0, &sample(vec![0x42, 0x92], Some(format(AVCC))))?;
++        guest.seen_once(4);
++        let frames = guest.emitted();
++        if device {
++            assert_eq!(frames[0].samples, Some([0x42, 0x42, 0, 0x92]));
++        } else {
++            assert_ne!(frames[0].status, NO_ERROR);
++        }
++        assert_eq!(guest.memory.scatter.copied.load(Ordering::SeqCst), 0);
++        assert_eq!(guest.memory.scatter.lends.load(Ordering::SeqCst), 0);
++    }
++    Ok(())
++}
+--- a/crates/reims-vgpu/src/platform.rs
++++ b/crates/reims-vgpu/src/platform.rs
+@@ -78,6 +78,19 @@
+     ) -> Result<(), &'static str> {
+         let _ = (surface, write);
+         Err("this platform lends no surface's bytes")
++    }
++
++    /// Optional synchronous CPU copy from packed readback rows to existing surface storage.
++    /// None keeps the ordinary contiguous lend. A host implementation must validate the
++    /// whole geometry before writing and preserve every byte outside the copied rows.
++    fn write_surface_planes(
++        &self,
++        surface: &Self::Surface,
++        layout: &reims_vgpu_video_core::surfaces::SurfaceLayout,
++        sources: &[reims_vgpu_video_core::surfaces::PlaneSource<'_>; 2],
++    ) -> Option<Result<(), reims_vgpu_video_core::surfaces::SurfaceError>> {
++        let _ = (surface, layout, sources);
++        None
+     }
+ 
+     /// Lends `surface`'s bytes, laid out as [`ApiPlatform::lend_surface_bytes`] lends them, to
+--- a/crates/reims-vgpu/src/platform/vulkan.rs
++++ b/crates/reims-vgpu/src/platform/vulkan.rs
+@@ -86,6 +86,24 @@
+         reims_vgpu_vulkan::os::lend_surface_bytes(surface, write)
+     }
+ 
++    #[cfg(target_os = "linux")]
++    fn write_surface_planes(
++        &self,
++        surface: &<Self as Platform>::Surface,
++        layout: &reims_vgpu_video_core::surfaces::SurfaceLayout,
++        sources: &[reims_vgpu_video_core::surfaces::PlaneSource<'_>; 2],
++    ) -> Option<Result<(), reims_vgpu_video_core::surfaces::SurfaceError>> {
++        use reims_vgpu_video_core::surfaces::SurfaceError;
++        Some(
++            layout
++                .plane_copy_regions(sources)
++                .and_then(|(extent, regions)| {
++                    reims_vgpu_vulkan::os::copy_surface_regions(surface, extent, &regions)
++                        .map_err(|why| SurfaceError::Unreachable(why.to_owned()))
++                }),
++        )
++    }
++
+     fn lend_surface_bytes_for_reading(
+         &self,
+         surface: &<Self as Platform>::Surface,
+--- a/crates/reims-vgpu-vulkan/src/os/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/surface.rs
+@@ -422,6 +422,112 @@
+             );
+         }
+         at += len;
++    }
++    Ok(())
++}
++
++/// Copy prevalidated logical regions directly to the surface's existing canonical RAM.
++/// Unlike a writable alias lend, this path never faults a second set of page tables and
++/// never gathers untouched bytes. Regions are ordered, nonoverlapping, and bounded by
++/// `required_length`, which includes the complete destination layout (including padding).
++/// All checks finish before any byte changes. As with lends, callers must not nest a lend.
++#[cfg(target_os = "linux")]
++pub fn copy_surface_regions(
++    surface: &OsSurface,
++    required_length: usize,
++    regions: &[(usize, &[u8])],
++) -> Result<(), &'static str> {
++    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    if surface.protection_options() != 0 || base == 0 {
++        return Err("a protected surface, whose memory the CPU never reaches");
++    }
++    if gpu_read_only(surface) {
++        return Err("a surface the guest made read-only for its clients");
++    }
++    let made = recorded(surface, |made| (made.pages.clone(), made.offset));
++    let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
++    let length = surface.alloc_size().saturating_sub(offset);
++    let length = usize::try_from(length).map_err(|_| "surface length exceeds host memory")?;
++    if required_length > length {
++        return Err("the copied layout exceeds the surface");
++    }
++    let mut previous_end = 0;
++    for &(at, bytes) in regions {
++        let end = at
++            .checked_add(bytes.len())
++            .ok_or("copied region overflow")?;
++        if at < previous_end || end > required_length {
++            return Err("invalid copied region order or bounds");
++        }
++        previous_end = end;
++    }
++    let held = match made {
++        Some((pages, _)) if !pages.is_empty() => {
++            in_runs(&pages, &(offset..offset + length.to_u64()))
++        }
++        _ => vec![
++            base..base
++                .checked_add(length.to_u64())
++                .ok_or("surface address overflow")?,
++        ],
++    };
++    let covered = held
++        .iter()
++        .try_fold(0usize, |total, range| {
++            let n = usize::try_from(range.end.checked_sub(range.start)?).ok()?;
++            total.checked_add(n)
++        })
++        .ok_or("surface page range overflow")?;
++    if covered != length {
++        return Err("the surface's canonical pages do not cover its allocation");
++    }
++    let _lend = LENDING.lock();
++    // A public safe copy can also be given bytes from overlapping host memory. Snapshot
++    // those inputs before changing anything, preserving memmove semantics across all regions
++    // and repeated destination pages. The ordinary decoder's staging buffer is disjoint.
++    let lowest = held.iter().map(|r| r.start).min().unwrap_or(0);
++    let highest = held.iter().map(|r| r.end).max().unwrap_or(0);
++    let overlaps = regions.iter().any(|(_, bytes)| {
++        let first = bytes.as_ptr().addr().to_u64();
++        let end = first.saturating_add(bytes.len().to_u64());
++        first < highest && lowest < end && held.iter().any(|r| first < r.end && r.start < end)
++    });
++    let snapshots = overlaps.then(|| {
++        regions
++            .iter()
++            .map(|(_, bytes)| bytes.to_vec())
++            .collect::<Vec<_>>()
++    });
++    let mut index = 0;
++    let mut run_start = 0usize;
++    for (region_index, &(at, input)) in regions.iter().enumerate() {
++        let bytes = snapshots
++            .as_ref()
++            .map_or(input, |copy| copy[region_index].as_slice());
++        let mut destination = at;
++        let mut source = 0;
++        while source < bytes.len() {
++            while destination >= run_start + (held[index].end - held[index].start).to_usize() {
++                run_start += (held[index].end - held[index].start).to_usize();
++                index += 1;
++            }
++            let run = &held[index];
++            let within = destination - run_start;
++            let count = (bytes.len() - source).min((run.end - run.start).to_usize() - within);
++            // SAFETY: the surface holds these canonical guest/owned pages exactly as in the
++            // existing lend path. All bounds and region order were checked above; LENDING
++            // serializes CPU writers. Each run is handled separately, so repeated physical
++            // pages never create simultaneous mutable slices. Overlapping inputs were copied.
++            unsafe {
++                std::ptr::copy_nonoverlapping(
++                    bytes.as_ptr().add(source),
++                    std::ptr::with_exposed_provenance_mut::<u8>(run.start.to_usize() + within),
++                    count,
++                );
++            }
++            destination += count;
++            source += count;
++        }
+     }
+     Ok(())
+ }
