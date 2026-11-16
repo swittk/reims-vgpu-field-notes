@@ -1,0 +1,19 @@
+{
+  "scope": "Sanitized source-only publication of locally built and tested version-specific Darwin 24 timing helper; not upstream-ready or a binary-identical repackaging",
+  "original_source_sha256": "8c4b2cf8cd12f9937853e186ebac59160d03a36204bea10f0b59a422a8c163e0",
+  "published_source_sha256": "f7424ec54daf8bdc8d0fe4f06cba5da8e7b04fa97688ef709411a52b16e84da1",
+  "exact_code_header_sha256": "ae89c94afac150dfdc659e203c7ff11e91639329e3e7d4a31cff6deab3654801",
+  "historical_tested_kext_sha256": "6360084f64159f6c6e48a946daeb0c4c6d4947e3971665164f142fbb9a02f61f",
+  "original_vs_published_source_difference": "one private bundle identifier string replaced in registration macro; no timing/driver logic changed",
+  "published_kext_binary": false,
+  "published_guest_kernel_collection": false,
+  "guest_version": "macOS Sequoia 15.8.1 (24H32), Darwin 24, x86-64",
+  "version": "0.1.0",
+  "lilu_version": "1.7.1",
+  "mac_kernel_sdk_commit": "3f750085caa17ec3a7880f11c11bf4f48cd6a164",
+  "cctools_port_commit": "df82634ce7c3eddba9722e881433fbe357396e16",
+  "original_live_implementation_matches_published_logic": true,
+  "standalone_sanitized_plugin_installed_in_guest": false,
+  "current_upstream_master_integration_validated": false,
+  "source_compiled_after_sanitization": "passed (Clang 19, pinned Lilu 1.7.1 and MacKernelSDK headers, network-disabled image, objects only)"
+}

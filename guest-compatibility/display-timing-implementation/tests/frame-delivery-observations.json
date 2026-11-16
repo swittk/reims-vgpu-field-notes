@@ -1,0 +1,11 @@
+{
+  "scope": "one x86-64 Sequoia guest / single Linux Vulkan host; separate bounded sequential trials",
+  "stage": "QEMU D-Bus Display1 distinct frames; not Moonlight physical display",
+  "corrected_first_fps": 55.543,
+  "uncorrected_return_fps": 50.591,
+  "corrected_final_fps": 59.646,
+  "corrected_final_unique_frames": 1695,
+  "uncorrected_p95_gap_ms": 35.1,
+  "corrected_final_p95_gap_ms": 22.2,
+  "limits": "not randomized or a cross-platform guarantee"
+}

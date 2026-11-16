@@ -1,5 +1,7 @@
 # Sequoia 60 Hz detailed-timing validity and CVDisplayLink behavior
 
+**Original helper source and reproducible evidence:** [ReimsDisplayTiming v0.1.0 implementation, build guidance, clock results and provenance](display-timing-implementation/README.md). The published source uses a sanitized bundle identifier; the tested live guest package is recorded by SHA-256.
+
 An x86 Sequoia guest using a paravirtual display could report visually disruptive timing despite a nominal 60 Hz mode. The inspected guest driver did not mark fixed detailed timing valid when returning it to the framebuffer timing API. The fallback estimated output time from interrupt intervals, which were sensitive to software scheduling jitter.
 
 A narrow, exact-version guest helper preserved the selected mode's real pixel-clock/pixel-count timing and indicated that the detailed timing was valid. It did **not** change the fixed refresh rate, invent a clock, or alter the host renderer.

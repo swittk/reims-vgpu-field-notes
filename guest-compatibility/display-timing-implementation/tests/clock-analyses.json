@@ -1,0 +1,114 @@
+{
+  "clock60-unpatched": {
+    "samples": 483,
+    "validHostTimes": 483,
+    "outputLeadMs": {
+      "min": -8385.712755999999,
+      "median": 23.80059,
+      "max": 10564.906321999999
+    },
+    "outside100ms": 9,
+    "periodNs": {
+      "min": 15647583.0,
+      "max": 16807736.0
+    },
+    "callbackHz": 60.404763520302886,
+    "maxCallbackGapMs": 24.241889999999998
+  },
+  "clock60-candidate": {
+    "samples": 479,
+    "validHostTimes": 479,
+    "outputLeadMs": {
+      "min": 23.468961999999998,
+      "median": 23.915604,
+      "max": 26.10117
+    },
+    "outside100ms": 0,
+    "periodNs": {
+      "min": 16666658.0,
+      "max": 16666658.0
+    },
+    "callbackHz": 59.993884604954445,
+    "maxCallbackGapMs": 18.825124
+  },
+  "clock60-candidate-game": {
+    "samples": 479,
+    "validHostTimes": 479,
+    "outputLeadMs": {
+      "min": 23.454774,
+      "median": 24.607953,
+      "max": 24.962647
+    },
+    "outside100ms": 0,
+    "periodNs": {
+      "min": 16666658.0,
+      "max": 16666658.0
+    },
+    "callbackHz": 59.99908096470494,
+    "maxCallbackGapMs": 17.959360999999998
+  },
+  "clock60-return": {
+    "samples": 483,
+    "validHostTimes": 483,
+    "outputLeadMs": {
+      "min": -15692.592859999999,
+      "median": 23.780718,
+      "max": 12568.731909999999
+    },
+    "outside100ms": 10,
+    "periodNs": {
+      "min": 15577904.0,
+      "max": 16893709.0
+    },
+    "callbackHz": 60.47357665615716,
+    "maxCallbackGapMs": 22.888277
+  },
+  "clock60-return-game": {
+    "samples": 477,
+    "validHostTimes": 477,
+    "outputLeadMs": {
+      "min": -35003.422755,
+      "median": 24.043076,
+      "max": 35541.890484999996
+    },
+    "outside100ms": 373,
+    "periodNs": {
+      "min": 15593834.0,
+      "max": 17565289.0
+    },
+    "callbackHz": 59.751217698528905,
+    "maxCallbackGapMs": 49.974654
+  },
+  "clock60-final": {
+    "samples": 480,
+    "validHostTimes": 480,
+    "outputLeadMs": {
+      "min": 23.664604999999998,
+      "median": 23.9155705,
+      "max": 24.969327
+    },
+    "outside100ms": 0,
+    "periodNs": {
+      "min": 16666658.0,
+      "max": 16666658.0
+    },
+    "callbackHz": 59.99996261964751,
+    "maxCallbackGapMs": 17.783313
+  },
+  "clock60-final-game": {
+    "samples": 479,
+    "validHostTimes": 479,
+    "outputLeadMs": {
+      "min": 23.562112,
+      "median": 24.67177,
+      "max": 24.965633999999998
+    },
+    "outside100ms": 0,
+    "periodNs": {
+      "min": 16666658.0,
+      "max": 16666658.0
+    },
+    "callbackHz": 60.00016074017958,
+    "maxCallbackGapMs": 18.008803
+  }
+}
