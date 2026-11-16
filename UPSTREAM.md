@@ -27,3 +27,7 @@ The FIFO guest-driver lost-wakeup issue has now been filed as [REIMS #158](https
 The archive prioritizes measured causes and source provenance. Current-upstream correctness/performance validation would be needed before opening new PRs. No maintainer acceptance is presumed.
 
 - [Sequoia Safari WebGL / Metal-profile correction](guest-compatibility/sequoia-metal-profile-implementation/README.md): exact-version guest compatibility helper is archived with source, measurements and licensing. Not a ready-to-merge general feature-profile change. Check any newer guest driver before filing.
+
+## Architecture compatibility caution (current master)
+
+Current [REIMS graphics-kext design](https://github.com/steelbrain/reims-vgpu/blob/818868564e31f9023c074f73840de97542592c91/docs/graphics-kext/design.md) describes a new REIMS-owned guest graphics device (reims-graphics-pci) with its own kext, replacing the historical AppleParavirtGPU graphics lane. Our Sequoia FIFO, detailed-timing, and feature-profile helpers were measured against the *older Apple driver path*. They remain useful for installations on that older path, but should **not** be reported as currently reproducible defects in the new guest driver without matching evidence. The separate [native Apple FIFO comparison](guest-compatibility/native-apple-fifo-comparison.md) has its own scope limitations.

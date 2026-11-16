@@ -1,5 +1,7 @@
 # x86-64 Sequoia guest FIFO lost notification
 
+**Separate native Apple-host comparison:** [Inspected PGFIFO/PGChildFIFO uses an untimed condition-variable wait, not a 100 ms polling wake](native-apple-fifo-comparison.md). This is a limited native framework inspection, not a matched native-guest benchmark.
+
 **Reviewable implementation now available:** [ReimsFifoOrder v0.1.3 Lilu helper source, original patch bytes, build requirements, static contract checks, native litmus and bounded store-buffer model](fifo-publication-implementation/README.md). The published code differs from the live-tested original only by replacement of the private bundle identifier; source object compilation passed, but the renamed plugin was not separately installed in a guest.
 
 **System:** x86-64 macOS Sequoia Apple paravirtual GPU task FIFO, a Linux REIMS host consumer. **Evidence:** exact guest memory state, finite independent concurrency tests and a carefully version-scoped guest workaround.
